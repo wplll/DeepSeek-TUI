@@ -8,7 +8,7 @@ use super::CommandResult;
 use crate::client::{PromptInspection, inspect_prompt_for_request};
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::localization::{Locale, MessageId, tr};
-use crate::models::{MessageRequest, SystemPrompt, context_window_for_model};
+use crate::models::{ContentBlock, MessageRequest, SystemPrompt, context_window_for_model};
 use crate::tui::app::{App, AppAction, TurnCacheRecord};
 use crate::tui::history::HistoryCell;
 
