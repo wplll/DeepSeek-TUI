@@ -482,7 +482,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "cache",
         aliases: &[],
-        usage: "/cache [count]",
+        usage: "/cache [count|inspect|warmup]",
         description_id: MessageId::CmdCacheDescription,
     },
 ];
@@ -912,6 +912,25 @@ mod tests {
             result.action,
             Some(AppAction::OpenContextInspector)
         ));
+    }
+
+    #[test]
+    fn cache_inspect_dispatches_through_cache_command() {
+        let mut app = create_test_app();
+        let result = execute("/cache inspect", &mut app);
+        let msg = result.message.expect("cache inspect should return text");
+        assert!(msg.contains("Cache Inspect"));
+        assert!(msg.contains("Base static prefix hash:"));
+        assert!(msg.contains("Full request prefix hash:"));
+        assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn cache_warmup_dispatches_action() {
+        let mut app = create_test_app();
+        let result = execute("/cache warmup", &mut app);
+        assert!(result.message.is_none());
+        assert!(matches!(result.action, Some(AppAction::CacheWarmup)));
     }
 
     #[test]

@@ -4,12 +4,13 @@
 //! request building (`build_chat_messages*`), and SSE parsing (`parse_sse_chunk`)
 //! all live here.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::time::timeout as tokio_timeout;
 
 /// Default idle timeout for SSE stream reads (300 seconds = 5 minutes).
@@ -411,12 +412,293 @@ pub(super) fn build_chat_messages(
 }
 
 pub(super) fn build_chat_messages_for_request(request: &MessageRequest) -> Vec<Value> {
-    build_chat_messages_with_reasoning(
-        request.system.as_ref(),
-        &request.messages,
-        &request.model,
-        should_replay_reasoning_content(&request.model, request.reasoning_effort.as_deref()),
+    PromptBuilder::for_request(request).build()
+}
+
+pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
+    PromptBuilder::for_request(request).inspect()
+}
+
+pub(crate) fn build_cache_warmup_request(request: &MessageRequest) -> MessageRequest {
+    PromptBuilder::for_request(request).build_cache_warmup_request()
+}
+
+struct PromptBuilder<'a> {
+    system: Option<&'a SystemPrompt>,
+    messages: &'a [Message],
+    model: &'a str,
+    reasoning_effort: Option<&'a str>,
+}
+
+impl<'a> PromptBuilder<'a> {
+    fn for_request(request: &'a MessageRequest) -> Self {
+        Self {
+            system: request.system.as_ref(),
+            messages: &request.messages,
+            model: &request.model,
+            reasoning_effort: request.reasoning_effort.as_deref(),
+        }
+    }
+
+    fn build(self) -> Vec<Value> {
+        build_chat_messages_with_reasoning(
+            self.system,
+            self.messages,
+            self.model,
+            should_replay_reasoning_content(self.model, self.reasoning_effort),
+        )
+    }
+
+    fn inspect(self) -> PromptInspection {
+        let messages = build_chat_messages_with_reasoning(
+            self.system,
+            self.messages,
+            self.model,
+            should_replay_reasoning_content(self.model, self.reasoning_effort),
+        );
+        inspect_wire_messages(&messages)
+    }
+
+    fn build_cache_warmup_request(self) -> MessageRequest {
+        let system = stable_system_prompt(self.system);
+        let mut messages = stable_history_messages(self.messages);
+        messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: CACHE_WARMUP_USER_TAIL.to_string(),
+                cache_control: None,
+            }],
+        });
+
+        MessageRequest {
+            model: self.model.to_string(),
+            messages,
+            max_tokens: 8,
+            system,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: self.reasoning_effort.map(str::to_string),
+            stream: None,
+            temperature: Some(0.0),
+            top_p: None,
+        }
+    }
+}
+
+pub(crate) const CACHE_WARMUP_USER_TAIL: &str = "请只回复 OK";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptInspection {
+    pub base_static_prefix_hash: String,
+    pub full_request_prefix_hash: String,
+    pub layers: Vec<PromptLayerInspection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptLayerInspection {
+    pub name: String,
+    pub stability: PromptLayerStability,
+    pub char_len: usize,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptLayerStability {
+    Static,
+    History,
+    Dynamic,
+}
+
+impl PromptLayerStability {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::History => "history",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
+
+fn inspect_wire_messages(messages: &[Value]) -> PromptInspection {
+    let mut layers = Vec::new();
+    let mut base_static_prefix_parts = Vec::new();
+    let mut full_request_prefix_parts = Vec::new();
+
+    for (index, message) in messages.iter().enumerate() {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let content = message_content_for_inspect(message);
+        let is_last = index + 1 == messages.len();
+
+        if index == 0 && role == "system" {
+            for (name, stability, body) in split_system_layers(&content) {
+                if stability == PromptLayerStability::Static {
+                    base_static_prefix_parts.push(body.to_string());
+                }
+                if stability != PromptLayerStability::Dynamic {
+                    full_request_prefix_parts.push(body.to_string());
+                }
+                layers.push(prompt_layer(name, stability, body));
+            }
+        } else {
+            let stability = if (is_last && role == "user") || role == "tool" {
+                PromptLayerStability::Dynamic
+            } else {
+                PromptLayerStability::History
+            };
+            let name = if is_last && role == "user" {
+                "User task".to_string()
+            } else {
+                format!("Message #{index} {role}")
+            };
+            if stability != PromptLayerStability::Dynamic {
+                full_request_prefix_parts.push(content.clone());
+            }
+            layers.push(prompt_layer(name, stability, &content));
+        }
+    }
+
+    let base_static_prefix = base_static_prefix_parts.join("\n");
+    let full_request_prefix = full_request_prefix_parts.join("\n");
+
+    PromptInspection {
+        base_static_prefix_hash: sha256_hex(base_static_prefix.as_bytes()),
+        full_request_prefix_hash: sha256_hex(full_request_prefix.as_bytes()),
+        layers,
+    }
+}
+
+fn message_content_for_inspect(message: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(content) = message.get("content").and_then(Value::as_str)
+        && !content.is_empty()
+    {
+        parts.push(content.to_string());
+    }
+    if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
+        && !reasoning.is_empty()
+    {
+        parts.push(reasoning.to_string());
+    }
+    if let Some(tool_calls) = message.get("tool_calls") {
+        parts.push(tool_calls.to_string());
+    }
+    parts.join("\n")
+}
+
+fn split_system_layers(content: &str) -> Vec<(String, PromptLayerStability, &str)> {
+    let markers = [
+        ("Project context", "<project_instructions"),
+        ("Project context pack", "## Project Context Pack"),
+        ("Environment", "## Environment"),
+        ("Configured instructions", "<instructions "),
+        ("User memory", "## User Memory"),
+        ("Current session goal", "## Current Session Goal"),
+        ("Skills", "## Skills"),
+        ("Context management", "## Context Management"),
+        ("Compact template", "## Compact"),
+        ("Previous session handoff", "## Previous Session Handoff"),
+    ];
+
+    let mut starts: Vec<(usize, &str)> = markers
+        .iter()
+        .filter_map(|(name, marker)| content.find(marker).map(|idx| (idx, *name)))
+        .collect();
+    starts.sort_by_key(|(idx, _)| *idx);
+
+    let mut layers = Vec::new();
+    let first_marker = starts.first().map_or(content.len(), |(idx, _)| *idx);
+    if first_marker > 0 {
+        layers.push((
+            "Global system prefix".to_string(),
+            PromptLayerStability::Static,
+            content[..first_marker].trim(),
+        ));
+    }
+
+    for (i, (start, name)) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).map_or(content.len(), |(idx, _)| *idx);
+        let stability = if *name == "Previous session handoff" {
+            PromptLayerStability::Dynamic
+        } else if is_static_base_layer(name) {
+            PromptLayerStability::Static
+        } else {
+            PromptLayerStability::History
+        };
+        layers.push(((*name).to_string(), stability, content[*start..end].trim()));
+    }
+
+    if layers.is_empty() {
+        layers.push((
+            "Global system prefix".to_string(),
+            PromptLayerStability::Static,
+            content.trim(),
+        ));
+    }
+    layers
+}
+
+fn is_static_base_layer(name: &str) -> bool {
+    matches!(
+        name,
+        "Global system prefix"
+            | "Environment"
+            | "Skills"
+            | "Project context"
+            | "Project context pack"
+            | "Context management"
+            | "Compact template"
     )
+}
+
+fn stable_system_prompt(system: Option<&SystemPrompt>) -> Option<SystemPrompt> {
+    let instructions = system_to_instructions(system.cloned())?;
+    let stable = split_system_layers(&instructions)
+        .into_iter()
+        .filter_map(|(_, stability, body)| {
+            (stability == PromptLayerStability::Static).then_some(body)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if stable.trim().is_empty() {
+        None
+    } else {
+        Some(SystemPrompt::Text(stable))
+    }
+}
+
+fn stable_history_messages(messages: &[Message]) -> Vec<Message> {
+    let mut end = messages.len();
+    if messages
+        .last()
+        .is_some_and(|message| message.role.as_str() == "user")
+    {
+        end = end.saturating_sub(1);
+    }
+    messages[..end].to_vec()
+}
+
+fn prompt_layer(
+    name: String,
+    stability: PromptLayerStability,
+    content: &str,
+) -> PromptLayerInspection {
+    PromptLayerInspection {
+        name,
+        stability,
+        char_len: content.chars().count(),
+        sha256: sha256_hex(content.as_bytes()),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn build_chat_messages_with_reasoning(
