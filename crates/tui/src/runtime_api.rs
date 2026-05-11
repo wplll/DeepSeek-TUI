@@ -2533,6 +2533,9 @@ mod tests {
                                 },
                                 status: TurnOutcomeStatus::Completed,
                                 error: None,
+                                tool_catalog: None,
+                                tool_catalog_hash: None,
+                                base_url: None,
                             })
                             .await;
                     }
@@ -2546,6 +2549,9 @@ mod tests {
                                 },
                                 status: TurnOutcomeStatus::Completed,
                                 error: None,
+                                tool_catalog: None,
+                                tool_catalog_hash: None,
+                                base_url: None,
                             })
                             .await;
                     }
@@ -2678,6 +2684,9 @@ mod tests {
                     },
                     status: TurnOutcomeStatus::Completed,
                     error: None,
+                    tool_catalog: None,
+                    tool_catalog_hash: None,
+                    base_url: None,
                 })
                 .await;
         });
@@ -2800,6 +2809,9 @@ mod tests {
                     },
                     status: TurnOutcomeStatus::Completed,
                     error: None,
+                    tool_catalog: None,
+                    tool_catalog_hash: None,
+                    base_url: None,
                 })
                 .await;
         });
@@ -3019,6 +3031,9 @@ mod tests {
                     },
                     status: TurnOutcomeStatus::Completed,
                     error: None,
+                    tool_catalog: None,
+                    tool_catalog_hash: None,
+                    base_url: None,
                 })
                 .await;
         });

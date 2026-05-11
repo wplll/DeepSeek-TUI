@@ -2803,6 +2803,9 @@ impl RuntimeThreadManager {
                     usage,
                     status,
                     error,
+                    tool_catalog: _,
+                    tool_catalog_hash: _,
+                    base_url: _,
                 } => {
                     turn_usage = Some(usage);
                     turn_status = match status {
@@ -3627,6 +3630,9 @@ mod tests {
                         },
                         status: TurnOutcomeStatus::Completed,
                         error: None,
+                        tool_catalog: None,
+                        tool_catalog_hash: None,
+                        base_url: None,
                     })
                     .await;
             }
@@ -3919,6 +3925,9 @@ mod tests {
                         },
                         status: TurnOutcomeStatus::Completed,
                         error: None,
+                        tool_catalog: None,
+                        tool_catalog_hash: None,
+                        base_url: None,
                     })
                     .await;
                 if turn_index >= 2 {
@@ -4153,6 +4162,9 @@ mod tests {
                 },
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                tool_catalog_hash: None,
+                base_url: None,
             })
             .await?;
 
@@ -4232,6 +4244,9 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                tool_catalog_hash: None,
+                base_url: None,
             })
             .await?;
         Ok(())
@@ -4307,6 +4322,9 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                tool_catalog_hash: None,
+                base_url: None,
             })
             .await?;
         Ok(())
@@ -4370,6 +4388,9 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                tool_catalog_hash: None,
+                base_url: None,
             })
             .await?;
 
@@ -4490,6 +4511,9 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                tool_catalog_hash: None,
+                base_url: None,
             })
             .await?;
         Ok(())
@@ -4570,6 +4594,9 @@ mod tests {
                 },
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                tool_catalog_hash: None,
+                base_url: None,
             })
             .await?;
 
@@ -4631,6 +4658,9 @@ mod tests {
                         },
                         status: TurnOutcomeStatus::Completed,
                         error: None,
+                        tool_catalog: None,
+                        tool_catalog_hash: None,
+                        base_url: None,
                     })
                     .await;
             }
@@ -4741,6 +4771,9 @@ mod tests {
                                 },
                                 status: TurnOutcomeStatus::Completed,
                                 error: None,
+                                tool_catalog: None,
+                                tool_catalog_hash: None,
+                                base_url: None,
                             })
                             .await;
                     }
@@ -4771,6 +4804,9 @@ mod tests {
                                 },
                                 status: TurnOutcomeStatus::Completed,
                                 error: None,
+                                tool_catalog: None,
+                                tool_catalog_hash: None,
+                                base_url: None,
                             })
                             .await;
                     }

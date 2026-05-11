@@ -9,7 +9,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::artifacts::ArtifactRecord;
-use crate::client::PromptInspection;
+use crate::client::{CacheWarmupKey, PromptInspection};
 use crate::compaction::CompactionConfig;
 use crate::config::{
     ApiProvider, Config, DEFAULT_TEXT_MODEL, SavedCredential, has_api_key, save_api_key,
@@ -19,7 +19,7 @@ use crate::core::coherence::CoherenceState;
 use crate::cycle_manager::{CycleBriefing, CycleConfig};
 use crate::hooks::{HookContext, HookEvent, HookExecutor, HookResult};
 use crate::localization::{Locale, MessageId, resolve_locale, tr};
-use crate::models::{Message, SystemPrompt, compaction_threshold_for_model_and_effort};
+use crate::models::{Message, SystemPrompt, Tool, compaction_threshold_for_model_and_effort};
 use crate::palette::{self, UiTheme};
 use crate::pricing::{CostCurrency, CostEstimate};
 use crate::session_manager::SessionContextReference;
@@ -633,6 +633,17 @@ pub struct SessionState {
     pub total_conversation_tokens: u32,
     pub turn_cache_history: VecDeque<TurnCacheRecord>,
     pub last_cache_inspection: Option<PromptInspection>,
+    pub last_warmup_key: Option<CacheWarmupKey>,
+    /// Tool catalog from the most recent API request.
+    /// Populated by the engine via `TurnComplete` so `/cache inspect` can
+    /// inspect the real tool schema without rebuilding the catalog.
+    pub last_tool_catalog: Option<Vec<Tool>>,
+    /// SHA-256 of the tool catalog JSON from the most recent API request.
+    /// Populated by the engine via `TurnComplete`.
+    pub last_tool_catalog_hash: Option<String>,
+    /// The API base URL used by the most recent request.
+    /// Populated by the engine via `TurnComplete`.
+    pub last_base_url: Option<String>,
 }
 
 impl Default for SessionState {
@@ -654,6 +665,10 @@ impl Default for SessionState {
             total_conversation_tokens: 0,
             turn_cache_history: VecDeque::new(),
             last_cache_inspection: None,
+            last_warmup_key: None,
+            last_tool_catalog: None,
+            last_tool_catalog_hash: None,
+            last_base_url: None,
         }
     }
 }

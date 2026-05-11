@@ -1151,6 +1151,8 @@ impl McpConnection {
                 break;
             }
         }
+        self.resources
+            .sort_by(|a, b| a.uri.cmp(&b.uri).then_with(|| a.name.cmp(&b.name)));
         Ok(())
     }
 
@@ -1194,6 +1196,11 @@ impl McpConnection {
                 break;
             }
         }
+        self.resource_templates.sort_by(|a, b| {
+            a.uri_template
+                .cmp(&b.uri_template)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         Ok(())
     }
 
@@ -1233,6 +1240,7 @@ impl McpConnection {
                 break;
             }
         }
+        self.prompts.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(())
     }
 
@@ -1577,13 +1585,14 @@ impl McpPool {
     /// Connect to all enabled servers, returning errors for failed connections
     pub async fn connect_all(&mut self) -> Vec<(String, anyhow::Error)> {
         let mut errors = Vec::new();
-        let names: Vec<String> = self
+        let mut names: Vec<String> = self
             .config
             .servers
             .keys()
             .filter(|n| self.config.servers[*n].is_enabled())
             .cloned()
             .collect();
+        names.sort();
 
         for name in names {
             if let Err(e) = self.get_or_connect(&name).await {
@@ -1591,16 +1600,21 @@ impl McpPool {
             }
         }
 
-        for (name, server_cfg) in &self.config.servers {
+        let mut required_names = self.config.servers.keys().cloned().collect::<Vec<_>>();
+        required_names.sort();
+        for name in required_names {
+            let Some(server_cfg) = self.config.servers.get(&name) else {
+                continue;
+            };
             if server_cfg.required
                 && server_cfg.is_enabled()
                 && !self
                     .connections
-                    .get(name)
+                    .get(&name)
                     .is_some_and(McpConnection::is_ready)
             {
                 errors.push((
-                    name.clone(),
+                    name,
                     anyhow::anyhow!("required MCP server failed to initialize"),
                 ));
             }
@@ -1638,6 +1652,11 @@ impl McpPool {
                 resources.push((format!("mcp_{}_{}", server, safe_name), resource));
             }
         }
+        resources.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.uri.cmp(&b.1.uri))
+                .then_with(|| a.1.name.cmp(&b.1.name))
+        });
         resources
     }
 
@@ -1651,13 +1670,18 @@ impl McpPool {
                 templates.push((format!("mcp_{}_{}", server, safe_name), template));
             }
         }
+        templates.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.uri_template.cmp(&b.1.uri_template))
+                .then_with(|| a.1.name.cmp(&b.1.name))
+        });
         templates
     }
 
     async fn list_resources(&mut self, server: Option<String>) -> Result<Vec<serde_json::Value>> {
         if let Some(server_name) = server {
             let conn = self.get_or_connect(&server_name).await?;
-            let resources = conn
+            let mut resources: Vec<_> = conn
                 .resources()
                 .iter()
                 .map(|resource| {
@@ -1670,6 +1694,7 @@ impl McpPool {
                     })
                 })
                 .collect();
+            resources.sort_by(resource_list_item_cmp);
             return Ok(resources);
         }
 
@@ -1686,6 +1711,7 @@ impl McpPool {
                 }));
             }
         }
+        items.sort_by(resource_list_item_cmp);
         Ok(items)
     }
 
@@ -1695,7 +1721,7 @@ impl McpPool {
     ) -> Result<Vec<serde_json::Value>> {
         if let Some(server_name) = server {
             let conn = self.get_or_connect(&server_name).await?;
-            let templates = conn
+            let mut templates: Vec<_> = conn
                 .resource_templates()
                 .iter()
                 .map(|template| {
@@ -1708,6 +1734,7 @@ impl McpPool {
                     })
                 })
                 .collect();
+            templates.sort_by(resource_list_item_cmp);
             return Ok(templates);
         }
 
@@ -1724,6 +1751,7 @@ impl McpPool {
                 }));
             }
         }
+        items.sort_by(resource_list_item_cmp);
         Ok(items)
     }
 
@@ -1736,6 +1764,7 @@ impl McpPool {
                 prompts.push((format!("mcp_{}_{}", server, prompt.name), prompt));
             }
         }
+        prompts.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
         prompts
     }
 
@@ -1782,11 +1811,13 @@ impl McpPool {
 
         // Add regular tools
         for (name, tool) in self.all_tools() {
+            let mut input_schema = tool.input_schema.clone();
+            crate::tools::schema_sanitize::stabilize_for_prefix(&mut input_schema);
             api_tools.push(crate::models::Tool {
                 tool_type: None,
                 name,
                 description: tool.description.clone().unwrap_or_default(),
-                input_schema: tool.input_schema.clone(),
+                input_schema,
                 allowed_callers: Some(vec!["direct".to_string()]),
                 defer_loading: Some(false),
                 input_examples: None,
@@ -2376,6 +2407,30 @@ fn snapshot_from_config(
 
 // === Helper Functions ===
 
+fn resource_list_item_cmp(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    resource_list_item_key(a).cmp(&resource_list_item_key(b))
+}
+
+fn resource_list_item_key(value: &serde_json::Value) -> (String, String, String) {
+    let server = value
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let uri = value
+        .get("uri")
+        .or_else(|| value.get("uri_template"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (server, uri, name)
+}
+
 /// Format MCP tool result for display
 #[allow(dead_code)] // Will be used when MCP tool results are displayed in TUI
 pub fn format_tool_result(result: &serde_json::Value) -> String {
@@ -2668,6 +2723,164 @@ mod tests {
 
     fn json_frame(value: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pool_orders_mcp_resources_prompts_and_schema_required_stably() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut alpha = test_connection(Box::new(ScriptedValueTransport {
+            sent: Arc::clone(&sent),
+            responses: VecDeque::new(),
+        }));
+        alpha.tools = vec![McpTool {
+            name: "lookup".to_string(),
+            description: Some("Lookup".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "zeta": {"type": "string"},
+                    "alpha": {"type": "string"}
+                },
+                "required": ["zeta", "alpha"]
+            }),
+        }];
+        alpha.resources = vec![
+            McpResource {
+                uri: "file:///z".to_string(),
+                name: "Zed".to_string(),
+                description: None,
+                mime_type: None,
+            },
+            McpResource {
+                uri: "file:///a".to_string(),
+                name: "Alpha".to_string(),
+                description: None,
+                mime_type: None,
+            },
+        ];
+        alpha.resource_templates = vec![
+            McpResourceTemplate {
+                uri_template: "file:///{z}".to_string(),
+                name: "Zed Template".to_string(),
+                description: None,
+                mime_type: None,
+            },
+            McpResourceTemplate {
+                uri_template: "file:///{a}".to_string(),
+                name: "Alpha Template".to_string(),
+                description: None,
+                mime_type: None,
+            },
+        ];
+        alpha.prompts = vec![
+            McpPrompt {
+                name: "summarize".to_string(),
+                description: None,
+                arguments: Vec::new(),
+            },
+            McpPrompt {
+                name: "analyze".to_string(),
+                description: None,
+                arguments: Vec::new(),
+            },
+        ];
+
+        let mut beta = test_connection(Box::new(ScriptedValueTransport {
+            sent,
+            responses: VecDeque::new(),
+        }));
+        beta.resources = vec![McpResource {
+            uri: "file:///b".to_string(),
+            name: "Beta".to_string(),
+            description: None,
+            mime_type: None,
+        }];
+
+        let mut pool = McpPool::new(McpConfig::default());
+        pool.connections.insert("beta".to_string(), beta);
+        pool.connections.insert("alpha".to_string(), alpha);
+
+        let resources = pool
+            .all_resources()
+            .into_iter()
+            .map(|(_, resource)| resource.uri.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(resources, vec!["file:///a", "file:///z", "file:///b"]);
+
+        let templates = pool
+            .all_resource_templates()
+            .into_iter()
+            .map(|(_, template)| template.uri_template.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(templates, vec!["file:///{a}", "file:///{z}"]);
+
+        let prompts = pool
+            .all_prompts()
+            .into_iter()
+            .map(|(_, prompt)| prompt.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, vec!["analyze", "summarize"]);
+
+        let listed_resources = pool.list_resources(None).await.expect("list resources");
+        let listed_uris = listed_resources
+            .iter()
+            .map(|item| item["uri"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(listed_uris, vec!["file:///a", "file:///z", "file:///b"]);
+
+        let tools = pool.to_api_tools();
+        let lookup = tools
+            .iter()
+            .find(|tool| tool.name == "mcp_alpha_lookup")
+            .expect("lookup tool");
+        assert_eq!(
+            lookup.input_schema["required"],
+            serde_json::json!(["alpha", "zeta"])
+        );
+    }
+
+    #[tokio::test]
+    async fn to_api_tools_is_stable_regardless_of_connection_insertion_order() {
+        fn pool_with_order(order: &[&str]) -> McpPool {
+            let mut pool = McpPool::new(McpConfig::default());
+            for name in order {
+                let mut conn = test_connection(Box::new(ScriptedValueTransport {
+                    sent: Arc::new(Mutex::new(Vec::new())),
+                    responses: VecDeque::new(),
+                }));
+                conn.tools = vec![McpTool {
+                    name: format!("{name}_tool"),
+                    description: Some(format!("Tool from {name}")),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "z_arg": {"type": "string"},
+                            "a_arg": {"type": "string"}
+                        },
+                        "required": ["z_arg", "a_arg"]
+                    }),
+                }];
+                pool.connections.insert(name.to_string(), conn);
+            }
+            pool
+        }
+
+        let ab = pool_with_order(&["alpha", "beta"]);
+        let ba = pool_with_order(&["beta", "alpha"]);
+
+        let tools_ab = ab.to_api_tools();
+        let tools_ba = ba.to_api_tools();
+
+        let names_ab: Vec<&str> = tools_ab.iter().map(|t| t.name.as_str()).collect();
+        let names_ba: Vec<&str> = tools_ba.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names_ab, names_ba, "tool names must be in the same order");
+
+        let json_ab = serde_json::to_string(&tools_ab).unwrap();
+        let json_ba = serde_json::to_string(&tools_ba).unwrap();
+        assert_eq!(
+            json_ab, json_ba,
+            "wire bytes must be identical regardless of connection insertion order"
+        );
     }
 
     #[tokio::test]

@@ -250,6 +250,60 @@ fn ensure_properties_object(obj: &mut Map<String, Value>) -> &mut Map<String, Va
         .expect("properties was just ensured as object")
 }
 
+/// Sort `properties` keys and `required` arrays in a JSON schema for
+/// deterministic serialization (prefix-cache stability).
+///
+/// Unlike [`sanitize`] this does **not** rewrite schema semantics — it only
+/// reorders map keys and array elements so that two schemas with the same
+/// logical content produce byte-identical JSON regardless of the order they
+/// were constructed in.
+///
+/// Walks recursively through all sub-schemas.
+pub fn stabilize_for_prefix(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        // Sort `required` array alphabetically (it is a semantic set).
+        if let Some(required) = obj.get_mut("required").and_then(Value::as_array_mut) {
+            required.sort_by(|a, b| {
+                a.as_str()
+                    .unwrap_or_default()
+                    .cmp(b.as_str().unwrap_or_default())
+            });
+        }
+
+        // Rebuild `properties` with sorted keys.
+        if let Some(props) = obj.remove("properties") {
+            if let Value::Object(map) = props {
+                let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut sorted = Map::new();
+                for (k, mut v) in entries {
+                    stabilize_for_prefix(&mut v);
+                    sorted.insert(k, v);
+                }
+                obj.insert("properties".into(), Value::Object(sorted));
+            } else {
+                obj.insert("properties".into(), props);
+            }
+        }
+
+        // Recurse into remaining values (items, anyOf, oneOf, allOf, etc.)
+        // Collect keys first to avoid borrow conflict.
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        for key in keys {
+            if key == "properties" || key == "required" {
+                continue;
+            }
+            if let Some(val) = obj.get_mut(&key) {
+                stabilize_for_prefix(val);
+            }
+        }
+    } else if let Some(arr) = schema.as_array_mut() {
+        for v in arr.iter_mut() {
+            stabilize_for_prefix(v);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +656,137 @@ mod tests {
         assert_eq!(tools[0].strict, Some(true));
         assert_eq!(tools[0].input_schema["required"], json!(["query"]));
         assert_eq!(tools[0].input_schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn stabilize_for_prefix_sorts_properties_keys() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "zeta": {"type": "string"},
+                "alpha": {"type": "string"},
+                "mu": {"type": "integer"}
+            }
+        });
+        stabilize_for_prefix(&mut schema);
+        let keys: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["alpha", "mu", "zeta"]);
+    }
+
+    #[test]
+    fn stabilize_for_prefix_sorts_required_array() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "zeta": {"type": "string"},
+                "alpha": {"type": "string"}
+            },
+            "required": ["zeta", "alpha"]
+        });
+        stabilize_for_prefix(&mut schema);
+        assert_eq!(schema["required"], json!(["alpha", "zeta"]));
+    }
+
+    #[test]
+    fn stabilize_for_prefix_sorts_nested_properties() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "outer_z": {
+                    "type": "object",
+                    "properties": {
+                        "inner_b": {"type": "string"},
+                        "inner_a": {"type": "string"}
+                    },
+                    "required": ["inner_b", "inner_a"]
+                },
+                "outer_a": {"type": "string"}
+            }
+        });
+        stabilize_for_prefix(&mut schema);
+
+        let outer_keys: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(outer_keys, vec!["outer_a", "outer_z"]);
+
+        let inner = &schema["properties"]["outer_z"];
+        let inner_keys: Vec<&str> = inner["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(inner_keys, vec!["inner_a", "inner_b"]);
+        assert_eq!(inner["required"], json!(["inner_a", "inner_b"]));
+    }
+
+    #[test]
+    fn stabilize_for_prefix_is_idempotent() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "zeta": {"type": "string"},
+                "alpha": {"type": "string"}
+            },
+            "required": ["zeta", "alpha"]
+        });
+        stabilize_for_prefix(&mut schema);
+        let first = schema.clone();
+        stabilize_for_prefix(&mut schema);
+        assert_eq!(schema, first, "stabilize_for_prefix must be idempotent");
+    }
+
+    #[test]
+    fn stabilize_for_prefix_same_content_different_map_order_produces_same_json() {
+        // Build two schemas with the same logical content but different
+        // serde_json::Map iteration orders by inserting keys in opposite order.
+        let mut a = json!({
+            "type": "object",
+            "properties": {
+                "zeta": {"type": "string"},
+                "mu": {"type": "integer"},
+                "alpha": {"type": "boolean"}
+            },
+            "required": ["zeta", "mu", "alpha"]
+        });
+        let mut b = json!({
+            "type": "object",
+            "properties": {
+                "alpha": {"type": "boolean"},
+                "mu": {"type": "integer"},
+                "zeta": {"type": "string"}
+            },
+            "required": ["alpha", "mu", "zeta"]
+        });
+
+        stabilize_for_prefix(&mut a);
+        stabilize_for_prefix(&mut b);
+
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+            "schemas with identical content must produce identical JSON after stabilization"
+        );
+    }
+
+    #[test]
+    fn stabilize_for_prefix_preserves_enum_order() {
+        // enum values are semantically ordered (positional); stabilize_for_prefix
+        // must NOT reorder them.
+        let mut schema = json!({
+            "type": "string",
+            "enum": ["high", "medium", "low"]
+        });
+        stabilize_for_prefix(&mut schema);
+        assert_eq!(schema["enum"], json!(["high", "medium", "low"]));
     }
 }

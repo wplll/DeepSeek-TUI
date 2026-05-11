@@ -67,8 +67,8 @@ prompt carries an extra block:
 </user_memory>
 ```
 
-The block sits above the volatile-content boundary in the prompt
-assembly so it stays inside DeepSeek's prefix cache turn-over-turn.
+The memory block is treated as dynamic prompt content because users
+can edit it between turns.
 The file is read at every prompt-build call — edits via `/memory`
 or external editors land on the next turn, no restart needed.
 

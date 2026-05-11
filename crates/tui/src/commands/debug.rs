@@ -5,7 +5,9 @@
 use std::time::Instant;
 
 use super::CommandResult;
-use crate::client::{PromptInspection, inspect_prompt_for_request};
+use crate::client::{
+    CacheWarmupKey, PromptInspection, PromptLayerInspection, inspect_prompt_for_request,
+};
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::localization::{Locale, MessageId, tr};
 use crate::models::{ContentBlock, MessageRequest, SystemPrompt, context_window_for_model};
@@ -138,8 +140,11 @@ pub fn context(_app: &mut App) -> CommandResult {
 /// Renders a fixed-width table the user can paste into a bug report.
 pub fn cache(app: &mut App, arg: Option<&str>) -> CommandResult {
     let arg = arg.map(str::trim).filter(|s| !s.is_empty());
-    if matches!(arg, Some("inspect")) {
-        return CommandResult::message(format_cache_inspect(app));
+    if let Some(inspect_arg) = arg.and_then(|a| a.strip_prefix("inspect")) {
+        let flags = inspect_arg.trim();
+        let verbose = flags.contains("--verbose");
+        let json_mode = flags.contains("--json");
+        return CommandResult::message(format_cache_inspect(app, verbose, json_mode));
     }
     if matches!(arg, Some("warmup")) {
         return CommandResult::action(AppAction::CacheWarmup);
@@ -158,7 +163,7 @@ pub fn cache(app: &mut App, arg: Option<&str>) -> CommandResult {
     CommandResult::message(format_cache_history(app, count, app.ui_locale))
 }
 
-fn format_cache_inspect(app: &mut App) -> String {
+fn format_cache_inspect(app: &mut App, verbose: bool, json_mode: bool) -> String {
     let reasoning_effort = if app.reasoning_effort == crate::tui::app::ReasoningEffort::Auto {
         app.last_effective_reasoning_effort
             .and_then(crate::tui::app::ReasoningEffort::api_value)
@@ -171,7 +176,7 @@ fn format_cache_inspect(app: &mut App) -> String {
         messages: app.api_messages.clone(),
         max_tokens: 0,
         system: app.system_prompt.clone(),
-        tools: None,
+        tools: app.session.last_tool_catalog.clone(),
         tool_choice: None,
         metadata: None,
         thinking: None,
@@ -181,7 +186,22 @@ fn format_cache_inspect(app: &mut App) -> String {
         top_p: None,
     };
     let inspection = inspect_prompt_for_request(&request);
+
     let previous = app.session.last_cache_inspection.as_ref();
+
+    // Compute warmup key from the current inspection.
+    let provider_str = format!("{:?}", app.api_provider);
+    let base_url = app.session.last_base_url.clone().unwrap_or_default();
+    let current_warmup_key =
+        CacheWarmupKey::from_inspection(&provider_str, &app.model, &base_url, &inspection);
+
+    if json_mode {
+        let json = serde_json::to_string_pretty(&inspection)
+            .unwrap_or_else(|_| "{\"error\": \"serialization failed\"}".to_string());
+        app.session.last_cache_inspection = Some(inspection);
+        app.session.last_warmup_key = Some(current_warmup_key);
+        return json;
+    }
 
     let mut out = String::new();
     out.push_str("Cache Inspect\n");
@@ -194,22 +214,40 @@ fn format_cache_inspect(app: &mut App) -> String {
         "Full request prefix hash: {}\n",
         inspection.full_request_prefix_hash
     ));
+    out.push_str(&format!(
+        "Tool catalog hash: {}\n",
+        if inspection.tool_catalog_hash.is_empty() {
+            "(no tools registered)".to_string()
+        } else {
+            inspection.tool_catalog_hash.clone()
+        }
+    ));
+    out.push_str(&format!(
+        "Stable prefix hash (excl. tools): {}\n",
+        inspection.stable_prefix_hash
+    ));
     out.push_str(&format_static_prefix_status(previous, &inspection));
     out.push_str(&format_first_divergence(previous, &inspection));
     out.push('\n');
 
+    // Estimate total tokens across all layers.
+    let total_tokens: usize = inspection.layers.iter().map(|l| l.token_estimate).sum();
+    out.push_str(&format!("Estimated total tokens: ~{total_tokens}\n\n"));
+
     for layer in &inspection.layers {
         let mut line = format!(
-            "{}: {}, chars={}, hash={}\n",
+            "{}: {}, chars={}, bytes={}, ~{}tok, hash={}\n",
             layer.name,
             layer.stability.label(),
             layer.char_len,
+            layer.byte_len,
+            layer.token_estimate,
             layer.sha256
         );
         if let Some(tool_result) = &layer.tool_result {
             let trimmed = line.trim_end_matches('\n').to_string();
             line = format!(
-                "{trimmed}, original_chars={}, sent_chars={}, truncated={}, deduplicated={}\n",
+                "{trimmed}, orig_chars={}, sent_chars={}, truncated={}, dedup={}\n",
                 tool_result.original_chars,
                 tool_result.sent_chars,
                 tool_result.truncated,
@@ -219,7 +257,7 @@ fn format_cache_inspect(app: &mut App) -> String {
         if let Some(turn_meta) = &layer.turn_meta {
             let trimmed = line.trim_end_matches('\n').to_string();
             line = format!(
-                "{trimmed}, turn_meta_original_chars={}, turn_meta_sent_chars={}, turn_meta_deduplicated={}, turn_meta_sha256={}\n",
+                "{trimmed}, meta_orig={}, meta_sent={}, meta_dedup={}, meta_hash={}\n",
                 turn_meta.original_chars,
                 turn_meta.sent_chars,
                 turn_meta.deduplicated,
@@ -228,8 +266,64 @@ fn format_cache_inspect(app: &mut App) -> String {
         }
         out.push_str(&line);
     }
+
+    // Verbose mode: show layer-by-layer diff with previous inspection.
+    if verbose {
+        out.push_str("\n── Verbose diff ──\n");
+        if let Some(prev) = previous {
+            out.push_str(&format_verbose_diff(prev, &inspection));
+        } else {
+            out.push_str("No previous inspection to compare against.\n");
+        }
+    }
+
+    // Warmup status.
+    out.push('\n');
+    out.push_str(&format_warmup_status(
+        app.session.last_warmup_key.as_ref(),
+        &current_warmup_key,
+    ));
+
     app.session.last_cache_inspection = Some(inspection);
+    app.session.last_warmup_key = Some(current_warmup_key);
     out
+}
+
+fn format_warmup_status(last_warmup: Option<&CacheWarmupKey>, current: &CacheWarmupKey) -> String {
+    match last_warmup {
+        None => format!(
+            "Warmup status: no previous warmup (current key: {}…)\n",
+            current.hash_short()
+        ),
+        Some(prev) if prev == current => format!(
+            "Warmup status: valid (key {}… matches)\n",
+            current.hash_short()
+        ),
+        Some(prev) => {
+            let mut reasons = Vec::new();
+            if prev.provider != current.provider {
+                reasons.push(format!("provider {}→{}", prev.provider, current.provider));
+            }
+            if prev.model != current.model {
+                reasons.push(format!("model {}→{}", prev.model, current.model));
+            }
+            if prev.base_url != current.base_url {
+                reasons.push(format!("base_url {}→{}", prev.base_url, current.base_url));
+            }
+            if prev.static_prefix_hash != current.static_prefix_hash {
+                reasons.push("static prefix changed".to_string());
+            }
+            if prev.tool_catalog_hash != current.tool_catalog_hash {
+                reasons.push("tool catalog changed".to_string());
+            }
+            format!(
+                "Warmup status: INVALID (key {}… → {}…, {})\n",
+                prev.hash_short(),
+                current.hash_short(),
+                reasons.join(", ")
+            )
+        }
+    }
 }
 
 fn format_static_prefix_status(
@@ -266,7 +360,11 @@ fn format_first_divergence(
         match (previous.layers.get(index), current.layers.get(index)) {
             (Some(prev), Some(curr)) if prev.name == curr.name && prev.sha256 == curr.sha256 => {}
             (Some(prev), Some(curr)) if prev.name == curr.name => {
-                return format!("First divergence from previous request: {}\n", curr.name);
+                let cause = infer_divergence_cause(&curr.name, prev, curr);
+                return format!(
+                    "First divergence from previous request: {}{}\n",
+                    curr.name, cause
+                );
             }
             (Some(_), Some(curr)) => {
                 return format!("First divergence from previous request: {}\n", curr.name);
@@ -284,6 +382,153 @@ fn format_first_divergence(
         }
     }
     "First divergence from previous request: none\n".to_string()
+}
+
+/// Infer a human-readable cause for why a layer diverged from the previous request.
+fn infer_divergence_cause(
+    layer_name: &str,
+    prev: &PromptLayerInspection,
+    curr: &PromptLayerInspection,
+) -> String {
+    // Size-based hints for common divergence patterns.
+    let char_delta = curr.char_len as i64 - prev.char_len as i64;
+
+    let hint = match layer_name {
+        "Tool schema" => {
+            if char_delta > 0 {
+                " (possible cause: tool added or schema expanded)"
+            } else if char_delta < 0 {
+                " (possible cause: tool removed or schema shrunk)"
+            } else {
+                " (possible cause: tool order or schema content changed)"
+            }
+        }
+        "Project context pack" => {
+            if char_delta.abs() > 100 {
+                " (possible cause: files added/removed from workspace)"
+            } else {
+                " (possible cause: file content or structure changed)"
+            }
+        }
+        "Project context" => " (possible cause: CLAUDE.md or AGENTS.md changed)",
+        "Skills" => {
+            if char_delta > 0 {
+                " (possible cause: new skill installed)"
+            } else if char_delta < 0 {
+                " (possible cause: skill removed)"
+            } else {
+                " (possible cause: skill content changed)"
+            }
+        }
+        "Environment" => " (possible cause: environment info updated)",
+        "Configured instructions" => " (possible cause: instructions file changed)",
+        "Global system prefix" => " (possible cause: mode prompt or base policy changed)",
+        "User memory" => " (possible cause: memory edited via /memory or # quick-add)",
+        "Current session goal" => " (possible cause: goal updated)",
+        "Previous session handoff" => " (possible cause: compaction rewrote handoff)",
+        "Context management" | "Compact template" => " (unexpected: compile-time constant changed)",
+        name if name.starts_with("Message #") => {
+            if char_delta.abs() > 500 {
+                " (possible cause: large tool result or message change)"
+            } else {
+                " (possible cause: message content changed)"
+            }
+        }
+        "User task" => " (expected: new user message each turn)",
+        _ => "",
+    };
+
+    if hint.is_empty() && curr.tool_result.as_ref().is_some_and(|t| t.deduplicated) {
+        " (tool result deduplicated)".to_string()
+    } else if hint.is_empty() && curr.turn_meta.as_ref().is_some_and(|t| t.deduplicated) {
+        " (turn meta deduplicated)".to_string()
+    } else {
+        hint.to_string()
+    }
+}
+
+/// Compare layer metadata between two inspections and produce a human-readable diff.
+/// Does NOT print full prompt text — only names, hashes, sizes, and stability labels.
+fn format_verbose_diff(prev: &PromptInspection, curr: &PromptInspection) -> String {
+    let mut out = String::new();
+    let max_len = prev.layers.len().max(curr.layers.len());
+
+    for index in 0..max_len {
+        match (prev.layers.get(index), curr.layers.get(index)) {
+            (Some(p), Some(c)) if p == c => {
+                out.push_str(&format!("  [{}] {} — unchanged\n", index, c.name));
+            }
+            (Some(p), Some(c)) => {
+                out.push_str(&format!("  [{}] {} — CHANGED\n", index, c.name));
+                if p.name != c.name {
+                    out.push_str(&format!("    name:     {} → {}\n", p.name, c.name));
+                }
+                if p.sha256 != c.sha256 {
+                    out.push_str(&format!(
+                        "    hash:     {}…{} → {}…{}\n",
+                        &p.sha256[..8],
+                        &p.sha256[p.sha256.len() - 8..],
+                        &c.sha256[..8],
+                        &c.sha256[c.sha256.len() - 8..],
+                    ));
+                }
+                if p.stability != c.stability {
+                    out.push_str(&format!(
+                        "    stability: {} → {}\n",
+                        p.stability.label(),
+                        c.stability.label()
+                    ));
+                }
+                if p.char_len != c.char_len {
+                    out.push_str(&format!(
+                        "    chars:    {} → {} ({:+})\n",
+                        p.char_len,
+                        c.char_len,
+                        c.char_len as i64 - p.char_len as i64
+                    ));
+                }
+                if p.byte_len != c.byte_len {
+                    out.push_str(&format!(
+                        "    bytes:    {} → {} ({:+})\n",
+                        p.byte_len,
+                        c.byte_len,
+                        c.byte_len as i64 - p.byte_len as i64
+                    ));
+                }
+                if p.token_estimate != c.token_estimate {
+                    out.push_str(&format!(
+                        "    tokens:   ~{} → ~{} ({:+})\n",
+                        p.token_estimate,
+                        c.token_estimate,
+                        c.token_estimate as i64 - p.token_estimate as i64
+                    ));
+                }
+                let cause = infer_divergence_cause(&c.name, p, c);
+                if !cause.is_empty() {
+                    out.push_str(&format!("    cause:{}\n", cause));
+                }
+            }
+            (Some(p), None) => {
+                out.push_str(&format!(
+                    "  [{}] {} — REMOVED (was {} chars, {} bytes, ~{}tok)\n",
+                    index, p.name, p.char_len, p.byte_len, p.token_estimate
+                ));
+            }
+            (None, Some(c)) => {
+                out.push_str(&format!(
+                    "  [{}] {} — ADDED ({} chars, {} bytes, ~{}tok, {})\n",
+                    index,
+                    c.name,
+                    c.char_len,
+                    c.byte_len,
+                    c.token_estimate,
+                    c.stability.label()
+                ));
+            }
+            (None, None) => break,
+        }
+    }
+    out
 }
 
 fn changed_static_layers(previous: &PromptInspection, current: &PromptInspection) -> Vec<String> {
@@ -421,7 +666,7 @@ fn humanize_age(d: std::time::Duration) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::models::{ContentBlock, Message, SystemBlock};
+    use crate::models::{ContentBlock, Message, SystemBlock, Tool};
     use crate::tui::app::{App, TuiOptions};
     use crate::tui::history::{GenericToolCell, ToolCell, ToolStatus};
     use std::path::PathBuf;
@@ -452,6 +697,20 @@ mod tests {
         app.ui_locale = crate::localization::Locale::En;
         app.api_provider = crate::config::ApiProvider::Deepseek;
         app
+    }
+
+    fn test_tool(name: &str) -> Tool {
+        Tool {
+            tool_type: Some("function".to_string()),
+            name: name.to_string(),
+            description: format!("Test tool {name}"),
+            input_schema: serde_json::json!({"type": "object"}),
+            allowed_callers: Some(vec!["direct".to_string()]),
+            defer_loading: None,
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        }
     }
 
     #[test]
@@ -681,10 +940,10 @@ mod tests {
         let result = cache(&mut app, Some("inspect"));
         let msg = result.message.expect("inspect output");
 
-        assert!(msg.contains("original_chars=14000"), "got: {msg}");
+        assert!(msg.contains("orig_chars=14000"), "got: {msg}");
         assert!(msg.contains("truncated=true"), "got: {msg}");
-        assert!(msg.contains("deduplicated=false"), "got: {msg}");
-        assert!(msg.contains("deduplicated=true"), "got: {msg}");
+        assert!(msg.contains("dedup=false"), "got: {msg}");
+        assert!(msg.contains("dedup=true"), "got: {msg}");
     }
 
     #[test]
@@ -724,11 +983,11 @@ mod tests {
         let result = cache(&mut app, Some("inspect"));
         let msg = result.message.expect("inspect output");
 
-        assert!(msg.contains("turn_meta_original_chars="), "got: {msg}");
-        assert!(msg.contains("turn_meta_sent_chars="), "got: {msg}");
-        assert!(msg.contains("turn_meta_deduplicated=false"), "got: {msg}");
-        assert!(msg.contains("turn_meta_deduplicated=true"), "got: {msg}");
-        assert!(msg.contains("turn_meta_sha256="), "got: {msg}");
+        assert!(msg.contains("meta_orig="), "got: {msg}");
+        assert!(msg.contains("meta_sent="), "got: {msg}");
+        assert!(msg.contains("meta_dedup=false"), "got: {msg}");
+        assert!(msg.contains("meta_dedup=true"), "got: {msg}");
+        assert!(msg.contains("meta_hash="), "got: {msg}");
         assert!(!msg.contains("Working set: src/lib.rs"), "got: {msg}");
     }
 
@@ -1392,6 +1651,680 @@ mod tests {
             &app.api_messages[2].content[0],
             ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call-a"
         ));
+    }
+
+    #[test]
+    fn cache_inspect_layer_hashes_are_stable_across_calls() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text(
+            "Base policy\n\n## Environment\n\n- shell: powershell".to_string(),
+        ));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "stable task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let first = cache(&mut app, Some("inspect"))
+            .message
+            .expect("first inspect");
+        // Clear last_cache_inspection so we rebuild from scratch.
+        app.session.last_cache_inspection = None;
+        let second = cache(&mut app, Some("inspect"))
+            .message
+            .expect("second inspect");
+
+        // Extract hashes from both outputs and compare.
+        let extract_hashes = |s: &str| -> Vec<String> {
+            s.lines()
+                .filter(|l| l.contains("hash="))
+                .filter_map(|l| l.split("hash=").nth(1).map(str::to_string))
+                .collect()
+        };
+        let h1 = extract_hashes(&first);
+        let h2 = extract_hashes(&second);
+        assert_eq!(h1, h2, "hashes must be stable across identical calls");
+    }
+
+    #[test]
+    fn cache_inspect_json_mode_roundtrips() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "json test".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let result = cache(&mut app, Some("inspect --json"));
+        let msg = result.message.expect("json output");
+
+        // Must be valid JSON.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&msg).expect("output must be valid JSON");
+
+        // Must contain the expected top-level keys.
+        assert!(parsed.get("base_static_prefix_hash").is_some());
+        assert!(parsed.get("full_request_prefix_hash").is_some());
+        assert!(parsed.get("layers").is_some());
+        let layers = parsed["layers"].as_array().expect("layers is array");
+        assert!(!layers.is_empty());
+
+        // Each layer must have byte_len and token_estimate.
+        for layer in layers {
+            assert!(layer.get("byte_len").is_some());
+            assert!(layer.get("token_estimate").is_some());
+            assert!(layer.get("char_len").is_some());
+            assert!(layer.get("sha256").is_some());
+            assert!(layer.get("name").is_some());
+            assert!(layer.get("stability").is_some());
+        }
+    }
+
+    #[test]
+    fn cache_inspect_verbose_shows_diff_on_change() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text(
+            "Base policy\n\n## Environment\n\n- shell: powershell".to_string(),
+        ));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "first task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        // First call — no previous inspection to diff against.
+        let first = cache(&mut app, Some("inspect --verbose"))
+            .message
+            .expect("first verbose");
+        assert!(
+            first.contains("No previous inspection to compare against"),
+            "got: {first}"
+        );
+
+        // Change the user message.
+        if let Some(last) = app.api_messages.last_mut()
+            && let Some(ContentBlock::Text { text, .. }) = last.content.first_mut()
+        {
+            *text = "second task".to_string();
+        }
+
+        // Second call — should show a diff.
+        let second = cache(&mut app, Some("inspect --verbose"))
+            .message
+            .expect("second verbose");
+        assert!(second.contains("── Verbose diff ──"), "got: {second}");
+        assert!(
+            second.contains("CHANGED") || second.contains("ADDED") || second.contains("REMOVED"),
+            "expected at least one diff marker, got: {second}"
+        );
+    }
+
+    #[test]
+    fn cache_inspect_default_mode_has_no_diff_output() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect"));
+        // Change message.
+        if let Some(last) = app.api_messages.last_mut()
+            && let Some(ContentBlock::Text { text, .. }) = last.content.first_mut()
+        {
+            *text = "task changed".to_string();
+        }
+        let second = cache(&mut app, Some("inspect"))
+            .message
+            .expect("second default");
+
+        // Default mode must NOT contain verbose diff markers.
+        assert!(
+            !second.contains("── Verbose diff ──"),
+            "default mode should not show verbose diff"
+        );
+        assert!(
+            !second.contains("CHANGED"),
+            "default mode should not show CHANGED markers"
+        );
+    }
+
+    #[test]
+    fn cache_inspect_divergence_cause_inference() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text(
+            "Base policy\n\n## Environment\n\n- shell: powershell".to_string(),
+        ));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "first task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect"));
+        // Change user message — should trigger cause inference.
+        if let Some(last) = app.api_messages.last_mut()
+            && let Some(ContentBlock::Text { text, .. }) = last.content.first_mut()
+        {
+            *text = "second task".to_string();
+        }
+        let second = cache(&mut app, Some("inspect"))
+            .message
+            .expect("second inspect");
+
+        // "User task" layer should show expected cause.
+        assert!(
+            second.contains("(expected: new user message each turn)"),
+            "got: {second}"
+        );
+    }
+
+    #[test]
+    fn cache_inspect_byte_len_and_token_estimate_present() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "test".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let result = cache(&mut app, Some("inspect"))
+            .message
+            .expect("inspect output");
+
+        // Every layer line must show bytes= and ~Ntok.
+        for line in result.lines() {
+            if line.contains("chars=") {
+                assert!(line.contains("bytes="), "missing bytes in: {line}");
+                assert!(
+                    line.contains("tok,") || line.contains("tok\n") || line.ends_with("tok"),
+                    "missing token_estimate in: {line}"
+                );
+            }
+        }
+        // Must show estimated total tokens.
+        assert!(result.contains("Estimated total tokens:"), "got: {result}");
+    }
+
+    // ── Phase 7: CacheWarmupKey tests ──
+
+    #[test]
+    fn warmup_key_is_stable_across_repeated_inspect() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key1 = app.session.last_warmup_key.clone().expect("key1");
+
+        // Run inspect again with the same state.
+        let _ = cache(&mut app, Some("inspect"));
+        let key2 = app.session.last_warmup_key.clone().expect("key2");
+
+        assert_eq!(
+            key1, key2,
+            "warmup key must be stable across repeated inspect"
+        );
+    }
+
+    #[test]
+    fn warmup_key_changes_when_model_changes() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key1 = app.session.last_warmup_key.clone().expect("key1");
+
+        app.model = "deepseek-v3".to_string();
+        let _ = cache(&mut app, Some("inspect"));
+        let key2 = app.session.last_warmup_key.clone().expect("key2");
+
+        assert_ne!(key1, key2, "warmup key must change when model changes");
+        assert_eq!(key1.provider, key2.provider);
+        assert_ne!(key1.model, key2.model);
+    }
+
+    #[test]
+    fn warmup_key_changes_when_provider_changes() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key1 = app.session.last_warmup_key.clone().expect("key1");
+
+        app.api_provider = crate::config::ApiProvider::DeepseekCN;
+        let _ = cache(&mut app, Some("inspect"));
+        let key2 = app.session.last_warmup_key.clone().expect("key2");
+
+        assert_ne!(key1, key2, "warmup key must change when provider changes");
+        assert_ne!(key1.provider, key2.provider);
+    }
+
+    #[test]
+    fn warmup_key_changes_when_static_prefix_changes() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy v1".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key1 = app.session.last_warmup_key.clone().expect("key1");
+
+        // Change the system prompt (static layer).
+        app.system_prompt = Some(SystemPrompt::Text("Base policy v2".to_string()));
+        let _ = cache(&mut app, Some("inspect"));
+        let key2 = app.session.last_warmup_key.clone().expect("key2");
+
+        assert_ne!(
+            key1, key2,
+            "warmup key must change when static prefix changes"
+        );
+    }
+
+    #[test]
+    fn warmup_key_does_not_change_when_user_message_changes() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "first task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key1 = app.session.last_warmup_key.clone().expect("key1");
+
+        // Change user message (dynamic layer).
+        if let Some(last) = app.api_messages.last_mut()
+            && let Some(ContentBlock::Text { text, .. }) = last.content.first_mut()
+        {
+            *text = "second task".to_string();
+        }
+        let _ = cache(&mut app, Some("inspect"));
+        let key2 = app.session.last_warmup_key.clone().expect("key2");
+
+        assert_eq!(
+            key1, key2,
+            "warmup key must not change when user message changes"
+        );
+    }
+
+    #[test]
+    fn warmup_key_changes_when_skills_change() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text(
+            "Base policy\n\n## Skills\n\n- skill-a".to_string(),
+        ));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key1 = app.session.last_warmup_key.clone().expect("key1");
+
+        // Change skills content (static layer).
+        app.system_prompt = Some(SystemPrompt::Text(
+            "Base policy\n\n## Skills\n\n- skill-a\n- skill-b".to_string(),
+        ));
+        let _ = cache(&mut app, Some("inspect"));
+        let key2 = app.session.last_warmup_key.clone().expect("key2");
+
+        assert_ne!(key1, key2, "warmup key must change when skills change");
+    }
+
+    #[test]
+    fn warmup_status_displayed_in_inspect_output() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        // First inspect — no previous warmup.
+        let first = cache(&mut app, Some("inspect"))
+            .message
+            .expect("first inspect");
+        assert!(
+            first.contains("Warmup status: no previous warmup"),
+            "got: {first}"
+        );
+
+        // Second inspect — same state, warmup key should match.
+        let second = cache(&mut app, Some("inspect"))
+            .message
+            .expect("second inspect");
+        assert!(second.contains("Warmup status: valid"), "got: {second}");
+    }
+
+    #[test]
+    fn warmup_key_in_json_output() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect --json"));
+        // JSON mode should also store the warmup key.
+        assert!(
+            app.session.last_warmup_key.is_some(),
+            "warmup key must be stored after JSON inspect"
+        );
+    }
+
+    #[test]
+    fn cache_inspect_shows_tool_catalog_hash_when_available() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+        app.session.last_tool_catalog = Some(vec![test_tool("read_file")]);
+
+        let result = cache(&mut app, Some("inspect"))
+            .message
+            .expect("inspect output");
+        assert!(
+            result.contains("Tool catalog hash: ") && !result.contains("(no tools registered)"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn cache_inspect_shows_no_tools_when_hash_unavailable() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+        // No tool catalog hash stored.
+        app.session.last_tool_catalog_hash = None;
+
+        let result = cache(&mut app, Some("inspect"))
+            .message
+            .expect("inspect output");
+        assert!(
+            result.contains("Tool catalog hash: (no tools registered)"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn cache_inspect_shows_stable_prefix_hash() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let result = cache(&mut app, Some("inspect"))
+            .message
+            .expect("inspect output");
+        assert!(
+            result.contains("Stable prefix hash (excl. tools):"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn cache_inspect_json_includes_tool_catalog_hash() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+        app.session.last_tool_catalog = Some(vec![test_tool("read_file")]);
+
+        let result = cache(&mut app, Some("inspect --json"))
+            .message
+            .expect("json output");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed["tool_catalog_hash"].as_str().unwrap().len(), 64);
+        assert!(
+            parsed["stable_prefix_hash"].as_str().is_some(),
+            "stable_prefix_hash must be present in JSON output"
+        );
+    }
+
+    #[test]
+    fn tool_catalog_hash_changes_when_stored_hash_changes() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        app.session.last_tool_catalog = Some(vec![test_tool("alpha")]);
+        let _ = cache(&mut app, Some("inspect")).message.expect("first");
+        let first_key = app.session.last_warmup_key.clone().expect("first key");
+
+        app.session.last_tool_catalog = Some(vec![test_tool("beta")]);
+        let second = cache(&mut app, Some("inspect")).message.expect("second");
+        let second_key = app.session.last_warmup_key.clone().expect("second key");
+        assert!(second.contains("Tool catalog hash: "));
+        assert_ne!(first_key.tool_catalog_hash, second_key.tool_catalog_hash);
+    }
+
+    #[test]
+    fn warmup_key_has_all_required_fields() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+        app.session.last_tool_catalog = Some(vec![test_tool("read_file")]);
+        app.session.last_base_url = Some("https://api.deepseek.com".to_string());
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key = app.session.last_warmup_key.clone().expect("key");
+
+        assert!(!key.provider.is_empty(), "provider must be set");
+        assert!(!key.model.is_empty(), "model must be set");
+        assert_eq!(key.base_url, "https://api.deepseek.com");
+        assert!(
+            !key.static_prefix_hash.is_empty(),
+            "static_prefix_hash must be set"
+        );
+        assert_eq!(key.tool_catalog_hash.len(), 64);
+        assert!(key.project_pack_hash.is_empty());
+        assert!(key.skills_hash.is_empty());
+    }
+
+    #[test]
+    fn warmup_key_changes_when_base_url_changes() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+        app.session.last_base_url = Some("https://api.deepseek.com".to_string());
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key1 = app.session.last_warmup_key.clone().expect("key1");
+
+        app.session.last_base_url = Some("https://custom.endpoint.com".to_string());
+        let _ = cache(&mut app, Some("inspect"));
+        let key2 = app.session.last_warmup_key.clone().expect("key2");
+
+        assert_ne!(key1, key2, "warmup key must change when base_url changes");
+        assert_ne!(key1.base_url, key2.base_url);
+    }
+
+    #[test]
+    fn warmup_key_changes_when_tool_catalog_hash_changes() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+        app.session.last_tool_catalog = Some(vec![test_tool("alpha")]);
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key1 = app.session.last_warmup_key.clone().expect("key1");
+
+        app.session.last_tool_catalog = Some(vec![test_tool("beta")]);
+        let _ = cache(&mut app, Some("inspect"));
+        let key2 = app.session.last_warmup_key.clone().expect("key2");
+
+        assert_ne!(
+            key1, key2,
+            "warmup key must change when tool_catalog_hash changes"
+        );
+    }
+
+    #[test]
+    fn warmup_key_changes_when_project_pack_or_skills_change() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text(
+            "Base policy\n\n## Project Context Pack\n\n<project_context_pack>\n{\"files\":[\"a.rs\"]}\n</project_context_pack>\n\n## Skills\n\n- rust: code"
+                .to_string(),
+        ));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let _ = cache(&mut app, Some("inspect"));
+        let key1 = app.session.last_warmup_key.clone().expect("key1");
+        assert_eq!(key1.project_pack_hash.len(), 64);
+        assert_eq!(key1.skills_hash.len(), 64);
+
+        app.system_prompt = Some(SystemPrompt::Text(
+            "Base policy\n\n## Project Context Pack\n\n<project_context_pack>\n{\"files\":[\"b.rs\"]}\n</project_context_pack>\n\n## Skills\n\n- rust: code"
+                .to_string(),
+        ));
+        let _ = cache(&mut app, Some("inspect"));
+        let key2 = app.session.last_warmup_key.clone().expect("key2");
+        assert_ne!(key1.project_pack_hash, key2.project_pack_hash);
+
+        app.system_prompt = Some(SystemPrompt::Text(
+            "Base policy\n\n## Project Context Pack\n\n<project_context_pack>\n{\"files\":[\"b.rs\"]}\n</project_context_pack>\n\n## Skills\n\n- go: code"
+                .to_string(),
+        ));
+        let _ = cache(&mut app, Some("inspect"));
+        let key3 = app.session.last_warmup_key.clone().expect("key3");
+        assert_ne!(key2.skills_hash, key3.skills_hash);
+    }
+
+    #[test]
+    fn warmup_key_does_not_depend_on_last_cache_inspection() {
+        let mut app = create_test_app();
+        app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "task".to_string(),
+                cache_control: None,
+            }],
+        });
+        app.session.last_tool_catalog = Some(vec![test_tool("read_file")]);
+        app.session.last_base_url = Some("https://api.deepseek.com".to_string());
+
+        // Run inspect first to populate last_cache_inspection.
+        let _ = cache(&mut app, Some("inspect"));
+        let key_with_inspect = app.session.last_warmup_key.clone().expect("key");
+
+        // Clear last_cache_inspection but keep other state.
+        app.session.last_cache_inspection = None;
+
+        // Run inspect again — key should be the same even without prior inspection.
+        let _ = cache(&mut app, Some("inspect"));
+        let key_without_inspect = app.session.last_warmup_key.clone().expect("key2");
+
+        assert_eq!(
+            key_with_inspect, key_without_inspect,
+            "warmup key must not depend on last_cache_inspection"
+        );
     }
 }
 

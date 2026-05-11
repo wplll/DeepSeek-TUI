@@ -573,6 +573,11 @@ fn build_default_headers(
 }
 
 impl DeepSeekClient {
+    /// Returns the API base URL used by this client.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// List available models from the provider.
     pub async fn list_models(&self) -> Result<Vec<AvailableModel>> {
         let url = api_url(&self.base_url, "models");
@@ -993,7 +998,7 @@ impl DeepSeekClient {
 
 mod chat;
 
-pub(crate) use chat::PromptInspection;
+pub(crate) use chat::{CacheWarmupKey, PromptInspection, PromptLayerInspection, tool_catalog_hash};
 
 pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
     chat::inspect_prompt_for_request(request)
@@ -1650,6 +1655,201 @@ mod tests {
         assert!(!second.layers.iter().any(
             |layer| layer.name.starts_with("Message #") && layer.stability.label() == "static"
         ));
+    }
+
+    #[test]
+    fn prompt_inspect_static_hash_ignores_diagnostics_and_tool_results() {
+        fn base_request(history_text: &str, tool_result: &str) -> MessageRequest {
+            MessageRequest {
+                model: "deepseek-v4-pro".to_string(),
+                messages: vec![
+                    Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: history_text.to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: vec![ContentBlock::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "diagnostics".to_string(),
+                            input: json!({"path": "src/lib.rs"}),
+                            caller: None,
+                        }],
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::ToolResult {
+                            tool_use_id: "tool-1".to_string(),
+                            content: tool_result.to_string(),
+                            is_error: None,
+                            content_blocks: None,
+                        }],
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "Current task".to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                ],
+                max_tokens: 1024,
+                system: Some(SystemPrompt::Text(
+                    "Base policy\n\n## Environment\n\n- shell: powershell\n\n## Skills\n\n- rust"
+                        .to_string(),
+                )),
+                tools: None,
+                tool_choice: None,
+                metadata: None,
+                thinking: None,
+                reasoning_effort: Some("max".to_string()),
+                stream: None,
+                temperature: None,
+                top_p: None,
+            }
+        }
+
+        let first = inspect_prompt_for_request(&base_request(
+            "<diagnostics file=\"src/lib.rs\">\n  ERROR [1:1] first\n</diagnostics>",
+            "first diagnostic result",
+        ));
+        let second = inspect_prompt_for_request(&base_request(
+            "<diagnostics file=\"src/lib.rs\">\n  ERROR [2:1] second\n</diagnostics>",
+            "second diagnostic result",
+        ));
+
+        assert_eq!(
+            first.base_static_prefix_hash, second.base_static_prefix_hash,
+            "diagnostics and tool results are volatile context, not static prefix"
+        );
+    }
+
+    #[test]
+    fn prompt_inspect_static_hash_changes_for_tool_schema_or_project_pack() {
+        fn request(tool_schema: serde_json::Value, project_pack: &str) -> MessageRequest {
+            MessageRequest {
+                model: "deepseek-v4-pro".to_string(),
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "Current task".to_string(),
+                        cache_control: None,
+                    }],
+                }],
+                max_tokens: 1024,
+                system: Some(SystemPrompt::Text(format!(
+                    "Base policy\n\n## Project Context Pack\n\n<project_context_pack>\n{project_pack}\n</project_context_pack>\n\n## Environment\n\n- shell: powershell"
+                ))),
+                tools: Some(vec![Tool {
+                    tool_type: Some("function".to_string()),
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    input_schema: tool_schema,
+                    allowed_callers: Some(vec!["direct".to_string()]),
+                    defer_loading: Some(false),
+                    input_examples: None,
+                    strict: None,
+                    cache_control: None,
+                }]),
+                tool_choice: None,
+                metadata: None,
+                thinking: None,
+                reasoning_effort: Some("max".to_string()),
+                stream: None,
+                temperature: None,
+                top_p: None,
+            }
+        }
+
+        let baseline = inspect_prompt_for_request(&request(
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            "{\"files\":[\"src/lib.rs\"]}",
+        ));
+        let changed_tool = inspect_prompt_for_request(&request(
+            json!({"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}}}),
+            "{\"files\":[\"src/lib.rs\"]}",
+        ));
+        let changed_pack = inspect_prompt_for_request(&request(
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            "{\"files\":[\"src/main.rs\"]}",
+        ));
+
+        assert_ne!(
+            baseline.base_static_prefix_hash, changed_tool.base_static_prefix_hash,
+            "tool schema is part of the stable API prefix"
+        );
+        assert_ne!(
+            baseline.base_static_prefix_hash, changed_pack.base_static_prefix_hash,
+            "project pack is part of the stable system prefix"
+        );
+        assert!(
+            baseline.layers.iter().any(|layer| {
+                layer.name == "Tool schema" && layer.stability.label() == "static"
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_inspect_is_stable_for_identical_request_input() {
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "Stable prior answer".to_string(),
+                        cache_control: None,
+                    }],
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "Current task".to_string(),
+                        cache_control: None,
+                    }],
+                },
+            ],
+            max_tokens: 1024,
+            system: Some(SystemPrompt::Text(
+                "Base policy\n\n## Environment\n\n- shell: powershell\n\n## Skills\n\n- rust"
+                    .to_string(),
+            )),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("max".to_string()),
+            stream: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let first = inspect_prompt_for_request(&request);
+        let second = inspect_prompt_for_request(&request);
+
+        assert_eq!(
+            first.base_static_prefix_hash, second.base_static_prefix_hash,
+            "identical prompt input must produce the same static prefix hash"
+        );
+        assert_eq!(
+            first.full_request_prefix_hash, second.full_request_prefix_hash,
+            "identical prompt input must produce the same full reusable prefix hash"
+        );
+        assert_eq!(
+            first
+                .layers
+                .iter()
+                .map(|layer| &layer.sha256)
+                .collect::<Vec<_>>(),
+            second
+                .layers
+                .iter()
+                .map(|layer| &layer.sha256)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

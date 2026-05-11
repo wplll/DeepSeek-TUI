@@ -21,7 +21,7 @@ use serde_json::json;
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::client::DeepSeekClient;
+use crate::client::{DeepSeekClient, tool_catalog_hash};
 use crate::compaction::{
     CompactionConfig, compact_messages_safe, merge_system_prompts, should_compact,
 };
@@ -945,6 +945,9 @@ impl Engine {
                     usage: turn.usage.clone(),
                     status: TurnOutcomeStatus::Failed,
                     error: Some(message),
+                    tool_catalog: None,
+                    tool_catalog_hash: None,
+                    base_url: None,
                 })
                 .await;
             return;
@@ -1095,6 +1098,13 @@ impl Engine {
             build_model_tool_catalog(registry.to_api_tools_with_cache(true), mcp_tools, mode)
         });
 
+        let tool_catalog_for_event = tools.clone();
+        let tool_catalog_hash = tools.as_ref().map(|t| tool_catalog_hash(t));
+        let base_url = self
+            .deepseek_client
+            .as_ref()
+            .map(|c| c.base_url().to_string());
+
         // Main turn loop
         let (status, error) = self
             .handle_deepseek_turn(
@@ -1127,6 +1137,9 @@ impl Engine {
                 usage: turn.usage,
                 status,
                 error,
+                tool_catalog: tool_catalog_for_event,
+                tool_catalog_hash,
+                base_url,
             })
             .await;
 
@@ -1164,6 +1177,9 @@ impl Engine {
                     usage: zero_usage,
                     status: TurnOutcomeStatus::Failed,
                     error: Some(message),
+                    tool_catalog: None,
+                    tool_catalog_hash: None,
+                    base_url: None,
                 })
                 .await;
             return;
@@ -1241,6 +1257,9 @@ impl Engine {
                 usage: zero_usage,
                 status: turn_status,
                 error: turn_error,
+                tool_catalog: None,
+                tool_catalog_hash: None,
+                base_url: None,
             })
             .await;
     }
@@ -1335,6 +1354,9 @@ impl Engine {
                     crate::core::events::TurnOutcomeStatus::Completed
                 },
                 error: result.error,
+                tool_catalog: None,
+                tool_catalog_hash: None,
+                base_url: None,
             })
             .await;
     }

@@ -122,6 +122,8 @@ impl DiagnosticBlock {
 #[must_use]
 pub fn render_blocks(blocks: &[DiagnosticBlock]) -> String {
     let mut chunks = Vec::new();
+    let mut blocks = blocks.iter().collect::<Vec<_>>();
+    blocks.sort_by(|a, b| a.file.cmp(&b.file));
     for block in blocks {
         let rendered = block.render();
         if !rendered.is_empty() {
@@ -178,6 +180,37 @@ mod tests {
             items: Vec::new(),
         };
         assert!(block.render().is_empty());
+    }
+
+    #[test]
+    fn render_blocks_sorts_files_for_prefix_stability() {
+        let blocks = vec![
+            DiagnosticBlock {
+                file: PathBuf::from("z.rs"),
+                items: vec![Diagnostic {
+                    line: 1,
+                    column: 1,
+                    severity: Severity::Error,
+                    message: "z".to_string(),
+                }],
+            },
+            DiagnosticBlock {
+                file: PathBuf::from("a.rs"),
+                items: vec![Diagnostic {
+                    line: 1,
+                    column: 1,
+                    severity: Severity::Error,
+                    message: "a".to_string(),
+                }],
+            },
+        ];
+
+        let rendered = render_blocks(&blocks);
+
+        assert!(
+            rendered.find("file=\"a.rs\"").expect("a block")
+                < rendered.find("file=\"z.rs\"").expect("z block")
+        );
     }
 
     #[test]

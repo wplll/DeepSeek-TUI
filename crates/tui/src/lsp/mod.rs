@@ -197,11 +197,12 @@ impl LspManager {
                 _ => false,
             })
             .collect();
-        items.sort_by_key(|d| match d.severity {
-            Severity::Error => 0u8,
-            Severity::Warning => 1u8,
-            Severity::Information => 2u8,
-            Severity::Hint => 3u8,
+        items.sort_by(|a, b| {
+            diagnostic_severity_rank(a.severity)
+                .cmp(&diagnostic_severity_rank(b.severity))
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.column.cmp(&b.column))
+                .then_with(|| a.message.cmp(&b.message))
         });
         let mut block = DiagnosticBlock {
             file: relative_to_workspace(&self.workspace, file),
@@ -261,6 +262,15 @@ impl LspManager {
         for transport in transports {
             transport.shutdown().await;
         }
+    }
+}
+
+fn diagnostic_severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Error => 0,
+        Severity::Warning => 1,
+        Severity::Information => 2,
+        Severity::Hint => 3,
     }
 }
 
@@ -446,6 +456,58 @@ pub(crate) mod tests {
         // Errors come first after sorting.
         assert_eq!(block.items[0].severity, Severity::Error);
         assert_eq!(block.items[1].severity, Severity::Warning);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_sorted_by_severity_location_and_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = LspManager::new(
+            LspConfig {
+                include_warnings: true,
+                ..LspConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+        let path = dir.path().join("foo.rs");
+        tokio::fs::write(&path, b"fn main() {}").await.unwrap();
+
+        let fake = Arc::new(FakeTransport::new(vec![
+            Diagnostic {
+                line: 10,
+                column: 1,
+                severity: Severity::Warning,
+                message: "warning".to_string(),
+            },
+            Diagnostic {
+                line: 2,
+                column: 5,
+                severity: Severity::Error,
+                message: "b error".to_string(),
+            },
+            Diagnostic {
+                line: 2,
+                column: 1,
+                severity: Severity::Error,
+                message: "a error".to_string(),
+            },
+        ]));
+        mgr.install_test_transport(Language::Rust, fake).await;
+
+        let block = mgr.diagnostics_for(&path, 1).await.expect("has block");
+        let order = block
+            .items
+            .iter()
+            .map(|item| (item.severity, item.line, item.column, item.message.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            order,
+            vec![
+                (Severity::Error, 2, 1, "a error"),
+                (Severity::Error, 2, 5, "b error"),
+                (Severity::Warning, 10, 1, "warning"),
+            ]
+        );
     }
 
     #[tokio::test]

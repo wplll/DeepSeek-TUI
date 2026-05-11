@@ -12,10 +12,14 @@
 //! context about the project's conventions, structure, and requirements.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
+use ignore::{DirEntry, WalkBuilder};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Names of project context files to look for, in priority order.
@@ -46,11 +50,26 @@ const PACK_IGNORED_DIRS: &[&str] = &[
     "dist",
     "build",
     "target",
+    ".next",
+    ".cache",
+    "coverage",
+    "logs",
+    "tmp",
+    "temp",
+    ".tmp",
     ".idea",
     ".vscode",
     ".pytest_cache",
-    ".DS_Store",
 ];
+const PACK_IGNORED_FILES: &[&str] = &[".ds_store", "thumbs.db"];
+
+#[derive(Debug, Clone)]
+struct CachedProjectPack {
+    manifest_hash: String,
+    rendered: String,
+}
+
+static PROJECT_PACK_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedProjectPack>>> = OnceLock::new();
 
 // === Errors ===
 
@@ -146,10 +165,30 @@ struct ReadmePack {
 /// sorted entries, bounded README text, and sorted JSON object fields. It does
 /// not include timestamps, random ids, absolute temp paths, or live git state.
 pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
+    let cache_key = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+
+    // Always walk the directory to compute entries + readme excerpt.
+    // The manifest_hash is the authoritative cache key — it covers
+    // the file list AND the README excerpt content, so it catches
+    // content changes that directory mtime alone would miss.
     let mut entries = Vec::new();
-    collect_pack_entries(workspace, workspace, 0, &mut entries);
-    entries.sort();
+    collect_pack_entries(workspace, &mut entries);
+    sort_pack_paths(&mut entries);
     entries.truncate(PACK_MAX_ENTRIES);
+
+    let readme = read_readme_excerpt(workspace, &entries);
+    let manifest_hash = project_pack_manifest_hash(&entries, readme.as_ref());
+
+    // Check cache: if manifest_hash matches, reuse the rendered pack.
+    if let Some(cached) = PROJECT_PACK_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+        && cached.manifest_hash == manifest_hash
+    {
+        return Some(cached.rendered);
+    }
 
     let mut config_files = entries
         .iter()
@@ -157,7 +196,7 @@ pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
         .take(PACK_MAX_CONFIG_FILES)
         .cloned()
         .collect::<Vec<_>>();
-    config_files.sort();
+    sort_pack_paths(&mut config_files);
 
     let mut key_source_files = entries
         .iter()
@@ -165,9 +204,8 @@ pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
         .take(PACK_MAX_SOURCE_FILES)
         .cloned()
         .collect::<Vec<_>>();
-    key_source_files.sort();
+    sort_pack_paths(&mut key_source_files);
 
-    let readme = read_readme_excerpt(workspace, &entries);
     let mut counts = BTreeMap::new();
     counts.insert("config_files".to_string(), config_files.len());
     counts.insert("directory_entries".to_string(), entries.len());
@@ -187,46 +225,79 @@ pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
     };
 
     let json = serde_json::to_string_pretty(&pack).ok()?;
-    Some(format!(
+    let rendered = format!(
         "## Project Context Pack\n\n<project_context_pack>\n{json}\n</project_context_pack>"
-    ))
+    );
+    if let Ok(mut cache) = PROJECT_PACK_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.insert(
+            cache_key,
+            CachedProjectPack {
+                manifest_hash,
+                rendered: rendered.clone(),
+            },
+        );
+    }
+    Some(rendered)
 }
 
-fn collect_pack_entries(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
-    if depth > PACK_MAX_DEPTH || out.len() >= PACK_MAX_ENTRIES {
-        return;
-    }
+fn collect_pack_entries(root: &Path, out: &mut Vec<String>) {
+    let mut builder = WalkBuilder::new(root);
+    let root_for_filter = root.to_path_buf();
+    builder
+        .max_depth(Some(PACK_MAX_DEPTH + 1))
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .require_git(false)
+        .filter_entry(move |entry| should_walk_pack_entry(&root_for_filter, entry));
+    let _ = builder.add_custom_ignore_filename(".deepseekignore");
 
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return;
+    for result in builder.build() {
+        let Ok(entry) = result else {
+            continue;
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let Some(relative) = relative_slash_path(root, entry.path()) else {
+            continue;
+        };
+        if is_ignored_pack_path(&relative, file_type.is_dir()) {
+            continue;
+        }
+        if file_type.is_dir() {
+            out.push(format!("{relative}/"));
+        } else if file_type.is_file() {
+            out.push(relative);
+        }
+    }
+}
+
+fn should_walk_pack_entry(root: &Path, entry: &DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    let Some(file_type) = entry.file_type() else {
+        return false;
     };
-    let mut children = read_dir.filter_map(Result::ok).collect::<Vec<_>>();
-    children.sort_by_key(|entry| entry.path());
-
-    for entry in children {
-        if out.len() >= PACK_MAX_ENTRIES {
-            break;
-        }
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() && PACK_IGNORED_DIRS.contains(&name) {
-            continue;
-        }
-
-        if let Some(relative) = relative_slash_path(root, &path) {
-            if file_type.is_dir() {
-                out.push(format!("{relative}/"));
-                collect_pack_entries(root, &path, depth + 1, out);
-            } else if file_type.is_file() {
-                out.push(relative);
-            }
-        }
+    if file_type.is_symlink() {
+        return false;
     }
+    let Some(relative) = relative_slash_path(root, entry.path()) else {
+        return false;
+    };
+    !is_ignored_pack_path(&relative, file_type.is_dir())
 }
 
 fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
@@ -235,11 +306,89 @@ fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
     for component in relative.components() {
         parts.push(component.as_os_str().to_string_lossy().to_string());
     }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("/"))
+    normalize_pack_relative_path(&parts.join("/"))
+}
+
+fn normalize_pack_relative_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return None;
+        }
+        parts.push(part);
     }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn sort_pack_paths(paths: &mut [String]) {
+    paths.sort_by(|a, b| {
+        pack_path_priority(a)
+            .cmp(&pack_path_priority(b))
+            .then_with(|| pack_path_sort_key(a).cmp(&pack_path_sort_key(b)))
+            .then_with(|| a.cmp(b))
+    });
+}
+
+fn pack_path_sort_key(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn pack_path_priority(path: &str) -> u8 {
+    let lower = pack_path_sort_key(path);
+    let name = lower.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    if matches!(name, "readme.md" | "readme.txt" | "readme") {
+        0
+    } else if is_config_file(&lower) {
+        1
+    } else if is_source_file(&lower) {
+        2
+    } else if lower.ends_with('/') {
+        3
+    } else {
+        4
+    }
+}
+
+fn is_ignored_pack_path(relative: &str, is_dir: bool) -> bool {
+    let normalized = relative.trim_end_matches('/');
+    let lower = normalized.to_ascii_lowercase();
+    if lower
+        .split('/')
+        .any(|part| PACK_IGNORED_DIRS.contains(&part))
+    {
+        return true;
+    }
+    if is_dir {
+        return false;
+    }
+    let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    PACK_IGNORED_FILES.contains(&name)
+        || name.ends_with(".log")
+        || name.ends_with(".tmp")
+        || name.ends_with(".temp")
+        || name.ends_with(".swp")
+        || name.ends_with(".swo")
+        || name.ends_with(".bak")
+        || name.ends_with('~')
+        || name.starts_with(".#")
+}
+
+fn project_pack_manifest_hash(entries: &[String], readme: Option<&ReadmePack>) -> String {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        hasher.update(entry.as_bytes());
+        hasher.update([0]);
+    }
+    if let Some(readme) = readme {
+        hasher.update(readme.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(readme.excerpt.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn read_readme_excerpt(workspace: &Path, entries: &[String]) -> Option<ReadmePack> {
@@ -608,7 +757,18 @@ pub fn merge_contexts(contexts: &[ProjectContext]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
+
+    fn sha256_hex(text: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn project_pack_hash(workspace: &Path) -> String {
+        sha256_hex(&generate_project_context_pack(workspace).expect("pack"))
+    }
 
     #[test]
     fn test_load_project_context_empty() {
@@ -812,6 +972,11 @@ mod tests {
         let second = generate_project_context_pack(tmp.path()).expect("pack again");
 
         assert_eq!(first, second);
+        assert_eq!(
+            sha256_hex(&first),
+            sha256_hex(&second),
+            "same project context must produce the same project pack hash"
+        );
         assert!(first.contains("\"project_name\""));
         assert!(first.contains("\"directory_structure\""));
         assert!(first.contains("\"README.md\""));
@@ -823,6 +988,191 @@ mod tests {
             first.find("\"src/a.rs\"").expect("a before z")
                 < first.find("\"src/z.rs\"").expect("z")
         );
+    }
+
+    #[test]
+    fn project_context_pack_is_stable_across_creation_order() {
+        let left_root = tempdir().expect("left tempdir");
+        let right_root = tempdir().expect("right tempdir");
+        let left = left_root.path().join("repo");
+        let right = right_root.path().join("repo");
+
+        fs::create_dir_all(left.join("src")).expect("mkdir left src");
+        fs::write(left.join("README.md"), "# Demo\n\nStable README").expect("left readme");
+        fs::write(left.join("Cargo.toml"), "[package]\nname = \"demo\"").expect("left cargo");
+        fs::write(left.join("src").join("z.rs"), "mod z;").expect("left z");
+        fs::write(left.join("src").join("a.rs"), "mod a;").expect("left a");
+
+        fs::create_dir_all(right.join("src")).expect("mkdir right src");
+        fs::write(right.join("src").join("a.rs"), "mod a;").expect("right a");
+        fs::write(right.join("src").join("z.rs"), "mod z;").expect("right z");
+        fs::write(right.join("Cargo.toml"), "[package]\nname = \"demo\"").expect("right cargo");
+        fs::write(right.join("README.md"), "# Demo\n\nStable README").expect("right readme");
+
+        assert_eq!(
+            generate_project_context_pack(&left),
+            generate_project_context_pack(&right)
+        );
+    }
+
+    #[test]
+    fn project_context_pack_ignores_volatile_paths() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Demo\n\nReadme body").expect("write readme");
+        fs::create_dir_all(tmp.path().join("src")).expect("mkdir src");
+        fs::write(tmp.path().join("src").join("lib.rs"), "pub fn stable() {}").expect("write lib");
+
+        let before = project_pack_hash(tmp.path());
+
+        for dir in [
+            ".git/objects",
+            "target/debug",
+            "node_modules/pkg",
+            "dist/assets",
+            "build/output",
+            ".next/cache",
+            "__pycache__",
+        ] {
+            fs::create_dir_all(tmp.path().join(dir)).expect("mkdir ignored dir");
+        }
+        fs::write(tmp.path().join(".git").join("HEAD"), "ref: refs/heads/main").expect("write git");
+        fs::write(
+            tmp.path().join("target").join("debug").join("build.log"),
+            "log",
+        )
+        .expect("write target");
+        fs::write(
+            tmp.path().join("node_modules").join("pkg").join("index.js"),
+            "ignored",
+        )
+        .expect("write node_modules");
+        fs::write(
+            tmp.path().join("dist").join("assets").join("app.js"),
+            "dist",
+        )
+        .expect("write dist");
+        fs::write(
+            tmp.path().join("build").join("output").join("app.js"),
+            "build",
+        )
+        .expect("write build");
+        fs::write(tmp.path().join(".next").join("cache").join("page"), "next").expect("write next");
+        fs::write(tmp.path().join("__pycache__").join("mod.pyc"), "pyc").expect("write pycache");
+        fs::write(tmp.path().join("run.log"), "log").expect("write log");
+        fs::write(tmp.path().join("scratch.tmp"), "tmp").expect("write tmp");
+
+        let after_pack = generate_project_context_pack(tmp.path()).expect("pack after ignores");
+        assert_eq!(before, sha256_hex(&after_pack));
+        for ignored in [
+            ".git",
+            "target",
+            "node_modules",
+            "dist",
+            "build",
+            ".next",
+            "__pycache__",
+            "run.log",
+            "scratch.tmp",
+        ] {
+            assert!(
+                !after_pack.contains(ignored),
+                "pack should not include ignored path {ignored}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_context_pack_readme_hash_is_stable_when_content_is_unchanged() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Demo\n\nStable body").expect("write readme");
+        fs::create_dir_all(tmp.path().join("src")).expect("mkdir src");
+        fs::write(tmp.path().join("src").join("lib.rs"), "pub fn stable() {}").expect("write lib");
+
+        let before = project_pack_hash(tmp.path());
+        fs::write(tmp.path().join("README.md"), "# Demo\n\nStable body").expect("rewrite readme");
+        let after = project_pack_hash(tmp.path());
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn project_context_pack_normalizes_windows_and_unix_paths_for_sorting() {
+        let mut windows_paths = vec![
+            normalize_pack_relative_path(r"src\z.rs").expect("normalize z"),
+            normalize_pack_relative_path(r".\src\a.rs").expect("normalize a"),
+            normalize_pack_relative_path(r"config\DeepSeek.toml").expect("normalize config"),
+        ];
+        let mut unix_paths = vec![
+            normalize_pack_relative_path("src/z.rs").expect("normalize z"),
+            normalize_pack_relative_path("./src/a.rs").expect("normalize a"),
+            normalize_pack_relative_path("config/DeepSeek.toml").expect("normalize config"),
+        ];
+
+        sort_pack_paths(&mut windows_paths);
+        sort_pack_paths(&mut unix_paths);
+
+        assert_eq!(windows_paths, unix_paths);
+        assert_eq!(
+            unix_paths,
+            vec![
+                "config/DeepSeek.toml".to_string(),
+                "src/a.rs".to_string(),
+                "src/z.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_context_pack_respects_gitignore_and_deepseekignore() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Demo").expect("write readme");
+        fs::write(tmp.path().join(".gitignore"), "ignored-by-git.rs\n").expect("write gitignore");
+        fs::write(
+            tmp.path().join(".deepseekignore"),
+            "ignored-by-deepseek.rs\n",
+        )
+        .expect("write deepseekignore");
+        fs::write(tmp.path().join("ignored-by-git.rs"), "ignored").expect("write git ignored");
+        fs::write(tmp.path().join("ignored-by-deepseek.rs"), "ignored")
+            .expect("write deepseek ignored");
+        fs::write(tmp.path().join("included.rs"), "included").expect("write included");
+
+        let pack = generate_project_context_pack(tmp.path()).expect("pack");
+
+        assert!(pack.contains("included.rs"));
+        assert!(!pack.contains("ignored-by-git.rs"));
+        assert!(!pack.contains("ignored-by-deepseek.rs"));
+    }
+
+    #[test]
+    fn project_context_pack_does_not_include_symlink_outside_workspace() {
+        let tmp = tempdir().expect("workspace tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        fs::write(tmp.path().join("README.md"), "# Demo").expect("write readme");
+        fs::write(
+            outside.path().join("secret.rs"),
+            "pub const SECRET: &str = \"outside\";",
+        )
+        .expect("write outside");
+
+        let link_path = tmp.path().join("linked-secret.rs");
+        if !try_symlink_file(&outside.path().join("secret.rs"), &link_path) {
+            return;
+        }
+
+        let pack = generate_project_context_pack(tmp.path()).expect("pack");
+        assert!(!pack.contains("linked-secret.rs"));
+        assert!(!pack.contains("SECRET"));
+    }
+
+    #[cfg(unix)]
+    fn try_symlink_file(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn try_symlink_file(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
     }
 
     #[test]
@@ -890,6 +1240,196 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("Project Structure (Auto-generated)")
+        );
+    }
+
+    #[test]
+    fn project_context_pack_hash_changes_when_readme_content_changes() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(
+            tmp.path().join("README.md"),
+            "# Original README\n\nOriginal body.",
+        )
+        .expect("write readme");
+        fs::create_dir_all(tmp.path().join("src")).expect("mkdir src");
+        fs::write(tmp.path().join("src").join("lib.rs"), "pub fn stable() {}").expect("write lib");
+
+        let before = project_pack_hash(tmp.path());
+
+        // Change README content — hash must change.
+        fs::write(
+            tmp.path().join("README.md"),
+            "# Modified README\n\nNew body content.",
+        )
+        .expect("rewrite readme");
+        let after = project_pack_hash(tmp.path());
+
+        assert_ne!(
+            before, after,
+            "project_pack_hash must change when README content changes"
+        );
+    }
+
+    #[test]
+    fn project_context_pack_hash_stable_when_readme_unchanged() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Stable README").expect("write readme");
+        fs::create_dir_all(tmp.path().join("src")).expect("mkdir src");
+        fs::write(tmp.path().join("src").join("main.rs"), "fn main() {}").expect("write main");
+
+        let first = project_pack_hash(tmp.path());
+        // Touch a non-readme file without changing its content.
+        let second = project_pack_hash(tmp.path());
+
+        assert_eq!(first, second, "hash must be stable when nothing changes");
+    }
+
+    #[test]
+    fn project_context_pack_hash_ignores_target_directory_changes() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Demo").expect("write readme");
+        fs::create_dir_all(tmp.path().join("src")).expect("mkdir src");
+        fs::write(tmp.path().join("src").join("lib.rs"), "pub fn x() {}").expect("write lib");
+
+        let before = project_pack_hash(tmp.path());
+
+        // Add files to target/ (ignored directory).
+        fs::create_dir_all(tmp.path().join("target").join("debug")).expect("mkdir target");
+        fs::write(
+            tmp.path().join("target").join("debug").join("binary"),
+            "binary content",
+        )
+        .expect("write target file");
+
+        let after = project_pack_hash(tmp.path());
+        assert_eq!(
+            before, after,
+            "hash must not change when ignored directory (target/) changes"
+        );
+    }
+
+    #[test]
+    fn project_context_pack_hash_changes_when_new_file_added() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Demo").expect("write readme");
+        fs::create_dir_all(tmp.path().join("src")).expect("mkdir src");
+        fs::write(tmp.path().join("src").join("lib.rs"), "pub fn x() {}").expect("write lib");
+
+        let before = project_pack_hash(tmp.path());
+
+        // Add a new source file that will appear in the pack.
+        fs::write(
+            tmp.path().join("src").join("new_module.rs"),
+            "pub fn new() {}",
+        )
+        .expect("write new module");
+
+        let after = project_pack_hash(tmp.path());
+        assert_ne!(
+            before, after,
+            "hash must change when a new file is added to the pack"
+        );
+    }
+
+    #[test]
+    fn project_context_pack_hash_changes_when_readme_excerpt_changes() {
+        let tmp = tempdir().expect("tempdir");
+        let long_readme = "A".repeat(5000);
+        fs::write(tmp.path().join("README.md"), &long_readme).expect("write long readme");
+
+        let before = project_pack_hash(tmp.path());
+
+        // Change only the first 4000 chars (which become the excerpt).
+        let mut new_readme = "B".repeat(4000);
+        new_readme.push_str(&"A".repeat(1000));
+        fs::write(tmp.path().join("README.md"), &new_readme).expect("write modified readme");
+
+        let after = project_pack_hash(tmp.path());
+        assert_ne!(
+            before, after,
+            "hash must change when README excerpt content changes"
+        );
+    }
+
+    #[test]
+    fn project_context_pack_hash_ignored_file_changes() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Demo").expect("write readme");
+        fs::create_dir_all(tmp.path().join("src")).expect("mkdir src");
+        fs::write(tmp.path().join("src").join("lib.rs"), "pub fn x() {}").expect("write lib");
+
+        let before = project_pack_hash(tmp.path());
+
+        // Add a .DS_Store file (ignored by PACK_IGNORED_FILES).
+        fs::write(tmp.path().join(".DS_Store"), "store data").expect("write ds_store");
+
+        let after = project_pack_hash(tmp.path());
+        assert_eq!(
+            before, after,
+            "hash must not change when an ignored file (.DS_Store) is added"
+        );
+    }
+
+    #[test]
+    fn project_context_pack_truncation_is_deterministic() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Big project").expect("write readme");
+
+        // Create more files than PACK_MAX_ENTRIES (400).
+        for i in 0..500 {
+            let name = format!("file_{:04}.rs", i);
+            fs::write(tmp.path().join(&name), format!("// file {i}")).expect("write file");
+        }
+
+        // Run twice — results must be identical (sort-then-truncate is stable).
+        let first = project_pack_hash(tmp.path());
+        let second = project_pack_hash(tmp.path());
+        assert_eq!(
+            first, second,
+            "pack hash must be deterministic with >400 candidates"
+        );
+    }
+
+    #[test]
+    fn project_context_pack_config_files_not_squeezed_out() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Project").expect("write readme");
+
+        // Create many ordinary source files that sort before config files.
+        for i in 0..100 {
+            let name = format!("aaa_{:03}.rs", i);
+            fs::write(tmp.path().join(&name), format!("// {i}")).expect("write file");
+        }
+
+        // Create a recognized config file (Cargo.toml).
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"demo\"")
+            .expect("write cargo");
+
+        let pack = generate_project_context_pack(tmp.path()).expect("pack");
+        // Cargo.toml is a recognized config file and must appear in the pack.
+        assert!(
+            pack.contains("Cargo.toml"),
+            "config file Cargo.toml must be present in pack"
+        );
+    }
+
+    #[test]
+    fn project_context_pack_prioritizes_readme_and_config_before_truncation() {
+        let tmp = tempdir().expect("tempdir");
+
+        for i in 0..600 {
+            let name = format!("aaa_{:03}.rs", i);
+            fs::write(tmp.path().join(&name), format!("// {i}")).expect("write file");
+        }
+        fs::write(tmp.path().join("README.md"), "# Project").expect("write readme");
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"demo\"")
+            .expect("write cargo");
+
+        let pack = generate_project_context_pack(tmp.path()).expect("pack");
+        assert!(pack.contains("README.md"), "README must survive truncation");
+        assert!(
+            pack.contains("Cargo.toml"),
+            "config file must survive truncation"
         );
     }
 }

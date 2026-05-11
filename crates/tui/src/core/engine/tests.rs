@@ -407,6 +407,91 @@ fn model_tool_catalog_sorts_each_partition_for_prefix_cache_stability() {
 }
 
 #[test]
+fn model_tool_catalog_serialization_is_stable_across_input_order() {
+    let first = build_model_tool_catalog(
+        vec![
+            api_tool("read_file"),
+            api_tool("apply_patch"),
+            api_tool("exec_shell"),
+        ],
+        vec![api_tool("mcp_zoo_b"), api_tool("mcp_aardvark_a")],
+        AppMode::Agent,
+    );
+    let second = build_model_tool_catalog(
+        vec![
+            api_tool("exec_shell"),
+            api_tool("read_file"),
+            api_tool("apply_patch"),
+        ],
+        vec![api_tool("mcp_aardvark_a"), api_tool("mcp_zoo_b")],
+        AppMode::Agent,
+    );
+
+    assert_eq!(
+        serde_json::to_string(&first).expect("serialize first catalog"),
+        serde_json::to_string(&second).expect("serialize second catalog"),
+        "same tool set must produce identical wire-order bytes regardless of input order"
+    );
+}
+
+#[test]
+fn model_tool_catalog_hash_is_stable_across_input_order() {
+    fn catalog_hash(native: Vec<Tool>, mcp: Vec<Tool>) -> String {
+        let catalog = build_model_tool_catalog(native, mcp, AppMode::Agent);
+        let json = serde_json::to_string(&catalog).expect("serialize");
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(json.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    let native = vec![
+        api_tool("read_file"),
+        api_tool("apply_patch"),
+        api_tool("exec_shell"),
+    ];
+    let mcp = vec![api_tool("mcp_zoo_b"), api_tool("mcp_aardvark_a")];
+
+    let hash_a = catalog_hash(native.clone(), mcp.clone());
+    let hash_b = catalog_hash(
+        vec![
+            api_tool("exec_shell"),
+            api_tool("read_file"),
+            api_tool("apply_patch"),
+        ],
+        vec![api_tool("mcp_aardvark_a"), api_tool("mcp_zoo_b")],
+    );
+
+    assert_eq!(
+        hash_a, hash_b,
+        "same tool set must produce identical hash regardless of input order"
+    );
+}
+
+#[test]
+fn model_tool_catalog_hash_changes_when_tool_set_changes() {
+    fn catalog_hash(native: Vec<Tool>, mcp: Vec<Tool>) -> String {
+        let catalog = build_model_tool_catalog(native, mcp, AppMode::Agent);
+        let json = serde_json::to_string(&catalog).expect("serialize");
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(json.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    let hash_without = catalog_hash(vec![api_tool("read_file"), api_tool("apply_patch")], vec![]);
+    let hash_with = catalog_hash(
+        vec![api_tool("read_file"), api_tool("apply_patch")],
+        vec![api_tool("mcp_new_server_new_tool")],
+    );
+
+    assert_ne!(
+        hash_without, hash_with,
+        "adding a tool must change the catalog hash"
+    );
+}
+
+#[test]
 fn active_tool_list_pushes_deferred_activations_to_the_tail() {
     // Regression for #263: when ToolSearch activates a deferred tool mid-
     // session, it must NOT be inserted at its catalog index — that would

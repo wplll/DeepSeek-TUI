@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::timeout as tokio_timeout;
@@ -420,6 +421,13 @@ pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInsp
     PromptBuilder::for_request(request).inspect()
 }
 
+pub(crate) fn tool_catalog_hash(tools: &[Tool]) -> String {
+    let values = tools.iter().map(tool_to_chat).collect::<Vec<_>>();
+    let content =
+        serde_json::to_string(&values).unwrap_or_else(|_| Value::Array(values).to_string());
+    sha256_hex(content.as_bytes())
+}
+
 pub(crate) fn build_cache_warmup_request(request: &MessageRequest) -> MessageRequest {
     PromptBuilder::for_request(request).build_cache_warmup_request()
 }
@@ -427,6 +435,7 @@ pub(crate) fn build_cache_warmup_request(request: &MessageRequest) -> MessageReq
 struct PromptBuilder<'a> {
     system: Option<&'a SystemPrompt>,
     messages: &'a [Message],
+    tools: Option<&'a [Tool]>,
     model: &'a str,
     reasoning_effort: Option<&'a str>,
 }
@@ -436,6 +445,7 @@ impl<'a> PromptBuilder<'a> {
         Self {
             system: request.system.as_ref(),
             messages: &request.messages,
+            tools: request.tools.as_deref(),
             model: &request.model,
             reasoning_effort: request.reasoning_effort.as_deref(),
         }
@@ -459,7 +469,13 @@ impl<'a> PromptBuilder<'a> {
             should_replay_reasoning_content(self.model, self.reasoning_effort),
             true,
         );
-        inspect_wire_messages(&messages)
+        let tools = self.tools.map(|tools| {
+            tools
+                .iter()
+                .map(tool_to_chat)
+                .collect::<Vec<serde_json::Value>>()
+        });
+        inspect_wire_messages(&messages, tools.as_deref())
     }
 
     fn build_cache_warmup_request(self) -> MessageRequest {
@@ -495,24 +511,106 @@ const TOOL_RESULT_SENT_CHAR_BUDGET: usize = 12_000;
 const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
 const TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PromptInspection {
     pub base_static_prefix_hash: String,
     pub full_request_prefix_hash: String,
+    /// Hash of the tool schema JSON (empty string when no tools registered).
+    pub tool_catalog_hash: String,
+    /// Hash of static layers excluding tool schema — used for warmup key.
+    pub stable_prefix_hash: String,
     pub layers: Vec<PromptLayerInspection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Identifies the stable prefix that a cache warmup primes.
+///
+/// Two warmup keys are equal when the warmup request would produce
+/// byte-identical stable prefixes — meaning a provider cache hit from
+/// the first warmup is still valid for the second.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CacheWarmupKey {
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    /// Hash of static system prompt layers (excluding tool schema).
+    pub static_prefix_hash: String,
+    /// Hash of the tool catalog JSON (empty if no tools).
+    pub tool_catalog_hash: String,
+    /// Hash of the Project Context Pack layer (empty when absent).
+    pub project_pack_hash: String,
+    /// Hash of the Skills layer (empty when absent).
+    pub skills_hash: String,
+}
+
+impl CacheWarmupKey {
+    pub(crate) fn new(
+        provider: &str,
+        model: &str,
+        base_url: &str,
+        static_prefix_hash: String,
+        tool_catalog_hash: String,
+        project_pack_hash: String,
+        skills_hash: String,
+    ) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            static_prefix_hash,
+            tool_catalog_hash,
+            project_pack_hash,
+            skills_hash,
+        }
+    }
+
+    pub(crate) fn from_inspection(
+        provider: &str,
+        model: &str,
+        base_url: &str,
+        inspection: &PromptInspection,
+    ) -> Self {
+        Self::new(
+            provider,
+            model,
+            base_url,
+            inspection.stable_prefix_hash.clone(),
+            inspection.tool_catalog_hash.clone(),
+            layer_hash(inspection, "Project context pack"),
+            layer_hash(inspection, "Skills"),
+        )
+    }
+
+    /// Returns a short hex prefix for display (first 12 chars of the hash).
+    pub(crate) fn hash_short(&self) -> String {
+        let json = serde_json::to_string(self).unwrap_or_default();
+        let hash = sha256_hex(json.as_bytes());
+        hash[..hash.len().min(12)].to_string()
+    }
+}
+
+fn layer_hash(inspection: &PromptInspection, name: &str) -> String {
+    inspection
+        .layers
+        .iter()
+        .find(|layer| layer.name == name)
+        .map(|layer| layer.sha256.clone())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PromptLayerInspection {
     pub name: String,
     pub stability: PromptLayerStability,
     pub char_len: usize,
+    pub byte_len: usize,
+    /// Rough token estimate (chars / 4, minimum 1 for non-empty layers).
+    pub token_estimate: usize,
     pub sha256: String,
     pub tool_result: Option<ToolResultInspection>,
     pub turn_meta: Option<TurnMetaInspection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ToolResultInspection {
     pub original_chars: usize,
     pub sent_chars: usize,
@@ -520,7 +618,7 @@ pub(crate) struct ToolResultInspection {
     pub deduplicated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TurnMetaInspection {
     pub original_chars: usize,
     pub sent_chars: usize,
@@ -528,7 +626,7 @@ pub(crate) struct TurnMetaInspection {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PromptLayerStability {
     Static,
     History,
@@ -545,12 +643,56 @@ impl PromptLayerStability {
     }
 }
 
-fn inspect_wire_messages(messages: &[Value]) -> PromptInspection {
+fn inspect_wire_messages(messages: &[Value], tools: Option<&[Value]>) -> PromptInspection {
     let mut layers = Vec::new();
     let mut base_static_prefix_parts = Vec::new();
+    let mut stable_prefix_parts = Vec::new(); // excludes tool schema
     let mut full_request_prefix_parts = Vec::new();
+    let mut tool_catalog_hash = String::new();
+
+    let mut message_start = 0usize;
+    if let Some(message) = messages.first() {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if role == "system" {
+            let content = message_content_for_inspect(message);
+            for (name, stability, body) in split_system_layers(&content) {
+                if stability == PromptLayerStability::Static {
+                    base_static_prefix_parts.push(body.to_string());
+                    stable_prefix_parts.push(body.to_string());
+                }
+                if stability != PromptLayerStability::Dynamic {
+                    full_request_prefix_parts.push(body.to_string());
+                }
+                layers.push(prompt_layer(name, stability, body));
+            }
+            message_start = 1;
+        }
+    }
+
+    if let Some(tools) = tools
+        && !tools.is_empty()
+    {
+        let content = serde_json::to_string(tools)
+            .unwrap_or_else(|_| Value::Array(tools.to_vec()).to_string());
+        tool_catalog_hash = sha256_hex(content.as_bytes());
+        base_static_prefix_parts.push(content.clone());
+        full_request_prefix_parts.push(content.clone());
+        // Note: stable_prefix_parts intentionally excludes tool schema —
+        // the warmup request does not include tools.
+        layers.push(prompt_layer(
+            "Tool schema".to_string(),
+            PromptLayerStability::Static,
+            &content,
+        ));
+    }
 
     for (index, message) in messages.iter().enumerate() {
+        if index < message_start {
+            continue;
+        }
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -558,43 +700,34 @@ fn inspect_wire_messages(messages: &[Value]) -> PromptInspection {
         let content = message_content_for_inspect(message);
         let is_last = index + 1 == messages.len();
 
-        if index == 0 && role == "system" {
-            for (name, stability, body) in split_system_layers(&content) {
-                if stability == PromptLayerStability::Static {
-                    base_static_prefix_parts.push(body.to_string());
-                }
-                if stability != PromptLayerStability::Dynamic {
-                    full_request_prefix_parts.push(body.to_string());
-                }
-                layers.push(prompt_layer(name, stability, body));
-            }
+        let stability = if (is_last && role == "user") || role == "tool" {
+            PromptLayerStability::Dynamic
         } else {
-            let stability = if (is_last && role == "user") || role == "tool" {
-                PromptLayerStability::Dynamic
-            } else {
-                PromptLayerStability::History
-            };
-            let name = if is_last && role == "user" {
-                "User task".to_string()
-            } else {
-                format!("Message #{index} {role}")
-            };
-            if stability != PromptLayerStability::Dynamic {
-                full_request_prefix_parts.push(content.clone());
-            }
-            let mut layer = prompt_layer(name, stability, &content);
-            layer.tool_result = tool_result_inspection_for_message(message);
-            layer.turn_meta = turn_meta_inspection_for_message(message);
-            layers.push(layer);
+            PromptLayerStability::History
+        };
+        let name = if is_last && role == "user" {
+            "User task".to_string()
+        } else {
+            format!("Message #{index} {role}")
+        };
+        if stability != PromptLayerStability::Dynamic {
+            full_request_prefix_parts.push(content.clone());
         }
+        let mut layer = prompt_layer(name, stability, &content);
+        layer.tool_result = tool_result_inspection_for_message(message);
+        layer.turn_meta = turn_meta_inspection_for_message(message);
+        layers.push(layer);
     }
 
     let base_static_prefix = base_static_prefix_parts.join("\n");
+    let stable_prefix = stable_prefix_parts.join("\n");
     let full_request_prefix = full_request_prefix_parts.join("\n");
 
     PromptInspection {
         base_static_prefix_hash: sha256_hex(base_static_prefix.as_bytes()),
         full_request_prefix_hash: sha256_hex(full_request_prefix.as_bytes()),
+        tool_catalog_hash,
+        stable_prefix_hash: sha256_hex(stable_prefix.as_bytes()),
         layers,
     }
 }
@@ -696,7 +829,10 @@ fn split_system_layers(content: &str) -> Vec<(String, PromptLayerStability, &str
 
     for (i, (start, name)) in starts.iter().enumerate() {
         let end = starts.get(i + 1).map_or(content.len(), |(idx, _)| *idx);
-        let stability = if *name == "Previous session handoff" {
+        let stability = if matches!(
+            *name,
+            "User memory" | "Current session goal" | "Previous session handoff"
+        ) {
             PromptLayerStability::Dynamic
         } else if is_static_base_layer(name) {
             PromptLayerStability::Static
@@ -729,7 +865,7 @@ fn is_static_base_layer(name: &str) -> bool {
     )
 }
 
-fn stable_system_prompt(system: Option<&SystemPrompt>) -> Option<SystemPrompt> {
+pub(crate) fn stable_system_prompt(system: Option<&SystemPrompt>) -> Option<SystemPrompt> {
     let instructions = system_to_instructions(system.cloned())?;
     let stable = split_system_layers(&instructions)
         .into_iter()
@@ -761,17 +897,26 @@ fn prompt_layer(
     stability: PromptLayerStability,
     content: &str,
 ) -> PromptLayerInspection {
+    let char_len = content.chars().count();
+    let byte_len = content.len();
+    let token_estimate = if char_len == 0 {
+        0
+    } else {
+        (char_len / 4).max(1)
+    };
     PromptLayerInspection {
         name,
         stability,
-        char_len: content.chars().count(),
+        char_len,
+        byte_len,
+        token_estimate,
         sha256: sha256_hex(content.as_bytes()),
         tool_result: None,
         turn_meta: None,
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
@@ -865,6 +1010,19 @@ fn compact_tool_result_for_wire(
     seen_tool_results: &mut HashMap<String, SeenToolResult>,
 ) -> WireToolResult {
     let original_chars = content.chars().count();
+
+    // Short content: skip dedup entirely — not worth the ref overhead.
+    // Do NOT compute hash or insert into seen_tool_results.
+    if original_chars <= TOOL_RESULT_SENT_CHAR_BUDGET {
+        return WireToolResult {
+            content: content.to_string(),
+            original_chars,
+            sent_chars: original_chars,
+            truncated: false,
+            deduplicated: false,
+        };
+    }
+
     let sha = sha256_hex(content.as_bytes());
 
     if let Some(previous) = seen_tool_results.get(&sha) {
@@ -888,16 +1046,6 @@ fn compact_tool_result_for_wire(
             original_chars,
         },
     );
-
-    if original_chars <= TOOL_RESULT_SENT_CHAR_BUDGET {
-        return WireToolResult {
-            content: content.to_string(),
-            original_chars,
-            sent_chars: original_chars,
-            truncated: false,
-            deduplicated: false,
-        };
-    }
 
     let head = first_chars(content, TOOL_RESULT_HEAD_CHARS);
     let tail = last_chars(content, TOOL_RESULT_TAIL_CHARS);
@@ -2528,19 +2676,26 @@ mod stream_decoder_tests {
 
     #[test]
     fn request_builder_deduplicates_identical_tool_results_for_wire() {
-        let output = "same tool output";
+        // Use content >12,000 chars so dedup is triggered.
+        let long_output = "X".repeat(13_000);
         let messages = vec![
             tool_use_message("tool-1", "read_file", json!({"path": "README.md"})),
-            tool_result_message("tool-1", output),
+            tool_result_message("tool-1", &long_output),
             tool_use_message("tool-2", "read_file", json!({"path": "README.md"})),
-            tool_result_message("tool-2", output),
+            tool_result_message("tool-2", &long_output),
         ];
 
         let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
         let first = tool_message_content(&built, 0);
         let second = tool_message_content(&built, 1);
 
-        assert_eq!(first, output);
+        // First is truncated (13k > 12k budget) but not deduplicated.
+        assert!(first.contains("TOOL_RESULT_TRUNCATED"), "got: {first}");
+        assert!(
+            !first.contains("TOOL_RESULT_REF"),
+            "first must not be a ref"
+        );
+        // Second is deduplicated via ref.
         assert!(
             second.starts_with("<TOOL_RESULT_REF sha=\""),
             "got: {second}"
@@ -2549,7 +2704,29 @@ mod stream_decoder_tests {
             second.contains("original_message=\"Message #1\""),
             "got: {second}"
         );
-        assert!(second.contains("chars=\"16\""), "got: {second}");
+    }
+
+    #[test]
+    fn short_tool_results_are_not_deduplicated() {
+        let short_output = "short output";
+        let messages = vec![
+            tool_use_message("tool-1", "read_file", json!({"path": "a.txt"})),
+            tool_result_message("tool-1", short_output),
+            tool_use_message("tool-2", "read_file", json!({"path": "b.txt"})),
+            tool_result_message("tool-2", short_output),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let first = tool_message_content(&built, 0);
+        let second = tool_message_content(&built, 1);
+
+        // Both must be the full original content — no ref for short content.
+        assert_eq!(first, short_output);
+        assert_eq!(second, short_output);
+        assert!(
+            !second.contains("TOOL_RESULT_REF"),
+            "short content must not generate ref, got: {second}"
+        );
     }
 
     #[test]

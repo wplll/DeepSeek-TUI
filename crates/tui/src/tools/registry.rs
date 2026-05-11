@@ -222,6 +222,7 @@ impl ToolRegistry {
             .map(|tool| {
                 let mut schema = tool.input_schema();
                 schema_sanitize::sanitize(&mut schema);
+                schema_sanitize::stabilize_for_prefix(&mut schema);
                 Tool {
                     tool_type: None,
                     name: tool.name().to_string(),
@@ -1236,6 +1237,33 @@ mod tests {
 
         assert_eq!(order_a, vec!["alpha", "mango", "zebra"]);
         assert_eq!(order_a, order_b);
+    }
+
+    #[test]
+    fn to_api_tools_json_bytes_are_stable_across_registration_order() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let json_a = {
+            let mut registry = ToolRegistry::new(ctx.clone());
+            registry.register(make_test_tool("zebra"));
+            registry.register(make_test_tool("alpha"));
+            registry.register(make_test_tool("mango"));
+            serde_json::to_string(&registry.to_api_tools()).unwrap()
+        };
+
+        let json_b = {
+            let mut registry = ToolRegistry::new(ctx.clone());
+            registry.register(make_test_tool("alpha"));
+            registry.register(make_test_tool("mango"));
+            registry.register(make_test_tool("zebra"));
+            serde_json::to_string(&registry.to_api_tools()).unwrap()
+        };
+
+        assert_eq!(
+            json_a, json_b,
+            "wire bytes must be identical regardless of registration order"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::core::coherence::CoherenceState;
 use crate::error_taxonomy::ErrorEnvelope;
-use crate::models::{Message, SystemPrompt, Usage};
+use crate::models::{Message, SystemPrompt, Tool, Usage};
 use crate::tools::spec::{ToolError, ToolResult};
 use crate::tools::subagent::SubAgentResult;
 use crate::tools::user_input::UserInputRequest;
@@ -92,6 +92,12 @@ pub enum Event {
         usage: Usage,
         status: TurnOutcomeStatus,
         error: Option<String>,
+        /// Tool catalog sent with this turn's request.
+        tool_catalog: Option<Vec<Tool>>,
+        /// SHA-256 of the tool catalog JSON sent with this turn's request.
+        tool_catalog_hash: Option<String>,
+        /// The API base URL used for this turn.
+        base_url: Option<String>,
     },
 
     /// Context compaction started.

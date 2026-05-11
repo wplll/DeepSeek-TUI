@@ -30,7 +30,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::audit::log_sensitive_event;
 use crate::automation_manager::{AutomationManager, AutomationSchedulerConfig, spawn_scheduler};
-use crate::client::{DeepSeekClient, build_cache_warmup_request};
+use crate::client::{CacheWarmupKey, DeepSeekClient, build_cache_warmup_request};
 use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL};
@@ -140,13 +140,11 @@ const DEFAULT_TERMINAL_PROBE_TIMEOUT_MS: u64 = 500;
 
 type AppTerminal = Terminal<ColorCompatBackend<Stdout>>;
 // Reset scroll region (`\x1b[r`), origin mode (`\x1b[?6l`), and home the cursor
-// (`\x1b[H`) before letting ratatui's diff renderer repaint. The destructive
-// `\x1b[2J\x1b[3J` pair was previously appended here to also wipe the visible
-// screen and saved scrollback, but combined with the immediately-following
-// `terminal.clear()` it produced a double-clear that several terminals
-// (Ghostty, VSCode terminal, Win10 conhost) render as visible flicker on every
-// TurnComplete / focus-gain / resize. The alt-screen buffer's double-buffering
-// plus ratatui's `terminal.clear()` are sufficient to repaint cleanly.
+// (`\x1b[H`) before letting ratatui's diff renderer repaint. We do NOT emit
+// `\x1b[2J`/`\x1b[3J` (screen-wipe) here — `reset_terminal_viewport` uses
+// `terminal.swap_buffers()` instead of `terminal.clear()` to force a full
+// repaint without the visible blank frame that `\x1b[2J` causes on Ghostty,
+// VSCode terminal, and Win10 conhost. See #flicker.
 const TERMINAL_ORIGIN_RESET: &[u8] = b"\x1b[r\x1b[?6l\x1b[H";
 
 /// Run the interactive TUI event loop.
@@ -883,7 +881,21 @@ async fn run_event_loop(
                         usage,
                         status,
                         error,
+                        tool_catalog,
+                        tool_catalog_hash,
+                        base_url,
                     } => {
+                        // Store tool catalog hash and base URL so /cache inspect
+                        // and /cache warmup can use them without re-computation.
+                        if let Some(catalog) = tool_catalog {
+                            app.session.last_tool_catalog = Some(catalog);
+                        }
+                        if let Some(hash) = tool_catalog_hash {
+                            app.session.last_tool_catalog_hash = Some(hash);
+                        }
+                        if let Some(url) = base_url {
+                            app.session.last_base_url = Some(url);
+                        }
                         force_terminal_repaint = true;
                         // Finalize any in-flight tool group. Cancellation
                         // marks still-running entries as Failed so the user
@@ -1691,7 +1703,11 @@ async fn run_event_loop(
                     );
                 }
 
-                reset_terminal_viewport(terminal)?;
+                // `terminal.resize()` already calls `clear()` internally
+                // (which resets buffers and emits \x1b[2J). Only send the
+                // origin-reset escapes here — a second buffer swap would be
+                // redundant and the extra \x1b[2J from `clear()` causes flicker.
+                reset_terminal_origin(terminal)?;
                 app.handle_resize(final_w, final_h);
                 // #macos-resize: some terminals (macOS Terminal.app, Windows
                 // ConHost) briefly report stale dimensions via
@@ -3040,7 +3056,7 @@ async fn run_cache_warmup(app: &App, config: &Config) -> Result<Usage> {
         messages: app.api_messages.clone(),
         max_tokens: 1024,
         system: app.system_prompt.clone(),
-        tools: None,
+        tools: app.session.last_tool_catalog.clone(),
         tool_choice: None,
         metadata: None,
         thinking: None,
@@ -4703,6 +4719,39 @@ async fn apply_command_result(
                 app.status_message = Some("Warming DeepSeek cache...".to_string());
                 match run_cache_warmup(app, config).await {
                     Ok(usage) => {
+                        // Compute warmup key directly from current app state.
+                        // Does NOT depend on last_cache_inspection.
+                        let reasoning_effort = if app.reasoning_effort == ReasoningEffort::Auto {
+                            app.last_effective_reasoning_effort
+                                .and_then(ReasoningEffort::api_value)
+                                .map(str::to_string)
+                        } else {
+                            app.reasoning_effort.api_value().map(str::to_string)
+                        };
+                        let request = MessageRequest {
+                            model: app.model.clone(),
+                            messages: app.api_messages.clone(),
+                            max_tokens: 0,
+                            system: app.system_prompt.clone(),
+                            tools: app.session.last_tool_catalog.clone(),
+                            tool_choice: None,
+                            metadata: None,
+                            thinking: None,
+                            reasoning_effort,
+                            stream: None,
+                            temperature: None,
+                            top_p: None,
+                        };
+                        let inspection = crate::client::inspect_prompt_for_request(&request);
+                        let base_url = app.session.last_base_url.clone().unwrap_or_default();
+                        let provider_str = format!("{:?}", app.api_provider);
+                        app.session.last_warmup_key = Some(CacheWarmupKey::from_inspection(
+                            &provider_str,
+                            &app.model,
+                            &base_url,
+                            &inspection,
+                        ));
+
                         let message = format_cache_warmup_result(&usage);
                         app.add_message(HistoryCell::System {
                             content: message.clone(),
@@ -6597,18 +6646,27 @@ fn resume_terminal(
     Ok(())
 }
 
-fn reset_terminal_viewport(terminal: &mut AppTerminal) -> Result<()> {
-    // Reset scroll margins and origin mode before clearing. Some interactive
-    // child processes leave DECSTBM/DECOM behind; if ratatui's diff renderer
-    // then writes "row 0", terminals can place it relative to the leaked
-    // scroll region and the whole viewport appears shifted down. We
-    // deliberately do *not* emit CSI 2J/3J here — see TERMINAL_ORIGIN_RESET
-    // for why; the immediately-following ratatui `terminal.clear()` flushes a
-    // single clear via the diff renderer, which the alt-screen buffer absorbs
-    // without visible flicker on the affected terminals.
+/// Send escape sequences to reset scroll margins, origin mode, and cursor
+/// position. Some interactive child processes leave DECSTBM/DECOM behind;
+/// if ratatui's diff renderer then writes "row 0", terminals can place it
+/// relative to the leaked scroll region and the whole viewport appears
+/// shifted down.
+fn reset_terminal_origin(terminal: &mut AppTerminal) -> Result<()> {
     terminal.backend_mut().write_all(TERMINAL_ORIGIN_RESET)?;
     terminal.backend_mut().flush()?;
-    terminal.clear()?;
+    Ok(())
+}
+
+/// Reset terminal origin and force a full repaint on the next draw.
+///
+/// Uses `swap_buffers()` instead of `clear()` to avoid emitting `\x1b[2J`
+/// (screen-wipe), which creates a visible blank frame on Ghostty, VSCode
+/// terminal, and Windows ConHost. `swap_buffers()` resets the back buffer
+/// so the diff renderer writes every cell on the next draw, without the
+/// intermediate blank frame.
+fn reset_terminal_viewport(terminal: &mut AppTerminal) -> Result<()> {
+    reset_terminal_origin(terminal)?;
+    terminal.swap_buffers();
     Ok(())
 }
 

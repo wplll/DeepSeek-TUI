@@ -308,9 +308,10 @@ pub fn system_prompt_for_mode_with_context(
 ///
 ///   1. mode prompt (compile-time constant)
 ///   2. project context / fallback (workspace-static)
-///   3. skills block (skills-dir-static)
-///   4. `## Context Management` (compile-time constant, Agent/Yolo only)
-///   5. compaction handoff template (compile-time constant)
+///   3. project context pack / environment / configured instructions
+///   4. skills block (skills-dir-static)
+///   5. `## Context Management` (compile-time constant, Agent/Yolo only)
+///   6. compaction handoff template (compile-time constant)
 ///   6. handoff block — file-backed; rewritten by `/compact` and on exit
 ///
 /// Anything appended after a volatile block forfeits the cache for the rest
@@ -413,24 +414,6 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
         full_prompt = format!("{full_prompt}\n\n{block}");
     }
 
-    // 2.5b. User memory block (#489). Goes above skills/context-management
-    // because it's session-stable: the memory file changes when the user
-    // edits it via `/memory` or `# foo` quick-add, but not turn-over-turn.
-    if let Some(memory_block) = session_context.user_memory_block
-        && !memory_block.trim().is_empty()
-    {
-        full_prompt = format!("{full_prompt}\n\n{memory_block}");
-    }
-
-    if let Some(goal_objective) = session_context.goal_objective
-        && !goal_objective.trim().is_empty()
-    {
-        full_prompt = format!(
-            "{full_prompt}\n\n## Current Session Goal\n\n<session_goal>\n{}\n</session_goal>",
-            goal_objective.trim()
-        );
-    }
-
     // 3. Skills block. #432: walks every candidate workspace
     // skills directory (`.agents/skills`, `skills`,
     // `.opencode/skills`, `.claude/skills`, `.cursor/skills`) plus global
@@ -474,6 +457,25 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     // ── Volatile-content boundary ─────────────────────────────────────────
     // Everything below drifts mid-session and busts the prefix cache for
     // bytes that follow. Keep new static blocks above this comment.
+
+    // User memory and session goal are complete model context, but both can
+    // change during a run (`/memory`, quick-add memory, goal updates). Keep
+    // them below all static prompt layers so they do not invalidate the stable
+    // skills/context-management/compact-template prefix.
+    if let Some(memory_block) = session_context.user_memory_block
+        && !memory_block.trim().is_empty()
+    {
+        full_prompt = format!("{full_prompt}\n\n{memory_block}");
+    }
+
+    if let Some(goal_objective) = session_context.goal_objective
+        && !goal_objective.trim().is_empty()
+    {
+        full_prompt = format!(
+            "{full_prompt}\n\n## Current Session Goal\n\n<session_goal>\n{}\n</session_goal>",
+            goal_objective.trim()
+        );
+    }
 
     // 6. Previous-session handoff (file-backed, rewritten by `/compact`).
     if let Some(handoff_block) = load_handoff_block(workspace) {
@@ -786,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn session_goal_is_injected_above_handoff_tail() {
+    fn session_goal_is_injected_after_static_prefix() {
         let tmp = tempdir().expect("tempdir");
         let prompt = match system_prompt_for_mode_with_context_skills_and_session(
             AppMode::Agent,
@@ -809,7 +811,7 @@ mod tests {
         let compact_pos = prompt.find("## Compaction Handoff").expect("compact block");
 
         assert!(prompt.contains("Fix transcript corruption"));
-        assert!(goal_pos < compact_pos);
+        assert!(compact_pos < goal_pos);
         assert!(!prompt.contains("src/lib.rs"));
     }
 

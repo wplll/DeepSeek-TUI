@@ -148,7 +148,10 @@ impl SkillRegistry {
             }
         };
 
-        for entry in entries.flatten() {
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries {
             let path = entry.path();
             // Skip hidden subdirectories. Common offenders are `.git`,
             // `.cache`, `.Trash`. The provided root itself is exempt:
@@ -1059,6 +1062,30 @@ mod tests {
         let rendered =
             super::render_available_skills_context_for_workspace(workspace).expect("non-empty");
         assert!(rendered.contains("from-claude"));
+    }
+
+    #[test]
+    fn render_skills_block_order_is_stable_regardless_of_push_order() {
+        // Verify that the rendered skills block produces the same output
+        // regardless of the order skills were added to the registry.
+        // The discover() function sorts by path, so this should be stable.
+        let tmpdir = TempDir::new().unwrap();
+        let root = tmpdir.path().join("skills");
+
+        // Create skills in reverse alphabetical order on disk
+        for name in &["zebra", "mango", "alpha"] {
+            write_skill(&root, name, &format!("{name} skill"), "body");
+        }
+
+        let rendered = super::render_available_skills_context(&root).expect("non-empty");
+        let alpha_pos = rendered.find("- alpha:").expect("alpha");
+        let mango_pos = rendered.find("- mango:").expect("mango");
+        let zebra_pos = rendered.find("- zebra:").expect("zebra");
+
+        assert!(
+            alpha_pos < mango_pos && mango_pos < zebra_pos,
+            "skills must be rendered in alphabetical order: alpha={alpha_pos}, mango={mango_pos}, zebra={zebra_pos}"
+        );
     }
 
     /// Regression for the GitHub issue where users organize skills under
